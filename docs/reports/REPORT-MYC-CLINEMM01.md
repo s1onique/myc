@@ -270,14 +270,22 @@ MCP_PROCESS_CARDINALITY          = one_per_session_per_registration
                                     MCP server, per runtime build /
                                     session).
 
-MCP_PROCESS_ENV_STATIC_OR_DYNAMIC = static at child spawn. Child gets
-                                    {...process.env, ...transport.env}.
-                                    ClineMM does NOT mutate
-                                    process.env per session —
-                                    confirmed by grep over
+MCP_PROCESS_ENV_STATIC_OR_DYNAMIC = per-call object at spawn. Each
+                                    stdio child receives
+                                    {...process.env, ...transport.env}
+                                    as a per-spawn object literal — the
+                                    host `process.env` is shared, but
+                                    the *per-child env object* is not
+                                    inherently shared between sessions
+                                    (each session has its own child
+                                    process with its own env). ClineMM
+                                    does NOT mutate `process.env` per
+                                    session — confirmed by grep over
                                     sdk/packages/core/src/ (no writes
                                     of process.env at session
-                                    boundaries).
+                                    boundaries). Materializing a
+                                    per-session value into the per-child
+                                    env object is what A2a adds.
 
 SESSION_ID_VISIBILITY_TO_CHILD   = none today. Session id is held in
                                     ClineMM's JS heap
@@ -285,7 +293,14 @@ SESSION_ID_VISIBILITY_TO_CHILD   = none today. Session id is held in
                                     the spawned MCP child's env. The
                                     stdio transport has no
                                     headers/argv decoration mechanism
-                                    for it.
+                                    for it. **The seam for A2a is the
+                                    spawn call site
+                                    (`extensions/mcp/client.ts:333-336`):
+                                    the per-child env object exists; the
+                                    session id is in scope upstream
+                                    (`local-runtime-host.ts:723`); only
+                                    the materialization path is
+                                    missing.**
 ```
 
 **Status.** Phase 1 = SHIPPED_AND_PROVEN for everything except
@@ -378,104 +393,216 @@ required for `myc_remember` reach semantics to mean what they say
 
 ---
 
-## Phase 3 — Transport decision
 
-The candidate set from RECON §8.4 was A / B / C:
+## Phase 3 — Transport decision (revised after review)
 
-```text
-A  per-session MCP child + MYC_SESSION_ID in spawn env
-B  additive per-call session argument in the MCP schema
-C  Cline-side bridge that wraps the myc CLI with MYC_SESSION_ID
-```
+### 3.0 Review-driven correction (added before Phase 5)
 
-Evaluated against Phase 1 + Phase 2 evidence:
+The original Phase 3 verdict selected Transport **B** (additive
+per-call `session` argument in the MCP schema, scoped to
+`myc_remember`). A reviewer challenged that on two grounds, both
+correct:
 
-### 3.1 Option A — per-session MCP child + `MYC_SESSION_ID` in env
+1. **Transport A was rejected for the wrong reason.** ClineMM's
+   `StdioMcpClient.spawnProcess` already takes an explicit `env`
+   object (`extensions/mcp/client.ts:333-336`). The session id is
+   already in scope at the runtime-build call site
+   (`local-runtime-host.ts:747` `this.runtimeBuilder.build(...)`,
+   with `sessionId` in scope from line 723). Nothing today threads
+   it into the spawn env, but the *seam* exists. The actual blocker
+   is **not** "ClineMM doesn't mutate `process.env`" — ClineMM
+   doesn't need to mutate anything global; the spawn env is a
+   per-call object that can carry per-session values. The blocker
+   is that the materialization path
+   `registration.env.MYC_SESSION_ID → ctx.session.sessionId`
+   does not exist in `resolvePluginMcpEnv`
+   (`plugin-server-registration.ts:54-87`); that function only
+   knows `{ fromEnv, value, required }` and resolves at
+   *registration load* time, reading `process.env[sourceName]` from
+   the host process.
 
-- **Cardinality fits:** Phase 1 confirms one stdio child per session
-  per registered MCP server.
-- **Data path is exact:** each `tools/call` becomes a fresh CLI
-  invocation (in-process `run()` in this fork, but with the same
-  `process.env` semantics), `resolveSession()` reads
-  `MYC_SESSION_ID` from `process.env` exactly as Claude Code /
-  Claude Code 2.1.x already do.
-- **The blocker is upstream:** ClineMM does **not** mutate
-  `process.env` per session. It calls `spawn(... env: { ...process.env,
-  ...transport.env })` with the host's `process.env`, which is the
-  shell env the user launched Cline with — *not* the per-session
-  value. No code under `sdk/packages/core/src/` writes
-  `process.env.MYC_SESSION_ID` at session boundaries.
-- **The schema can ask for it via `fromEnv`,** but the source value
-  is not in `process.env`, so `fromEnv` resolves to empty, and
-  `required` either kills the MCP server or the value silently
-  becomes empty.
+2. **Transport B is incomplete under the visibility invariant.**
+   The original B scoped the `session` argument to `myc_remember`
+   only. But Phase 2 evidence shows `myc_prime`
+   (`packages/cli/src/commands/prime.ts:739`) and `myc_recall`
+   (`packages/cli/src/commands/recall.ts:523`) also call
+   `resolveSession()` and filter on the resulting session id. With
+   B-as-scoped, those calls return `""`, and
+   `packages/core/src/reach.ts:195-198` `visibleInPrime` then
+   filters session-reach items out of `prime`'s output
+   (`current.length > 0 && info.session === current` — both legs
+   fail when `current` is empty). That breaks the very invariant
+   "session A sees its own session-reach memory" — *worse* than
+   showing session B's memory. To preserve the invariant, B must
+   carry session on **at least** `myc_remember`, `myc_prime`, and
+   `myc_recall` (and probably `myc_review`, where reach/audit
+   attribution matters). At that scope, B is no longer a
+   one-argument addition; it's a per-tool schema and dispatch
+   maintenance contract that has to be kept in lockstep with
+   every new myc tool that touches reach.
 
-**Status A:** blocked upstream. Requires a ClineMM change that we do
-not own. **NOT chosen** as the primary path, but is the *desired*
-steady-state if/when Cline exposes session env propagation.
-
-### 3.2 Option B — additive per-call `session` argument in the MCP schema
-
-- **Cardinality fits:** one tool call, one session argument. The
-  payload is unambiguous.
-- **Myc-side change is small:** add an optional `session: string` to
-  each tool's `inputSchema` that needs it (today: `myc_remember`
-  only, per Phase 2 evidence — we should not mechanically inject
-  session ids into tools that do not record them), and pass
-  `--session <value>` into the CLI argv in `dispatch.ts` and/or
-  `command.ts:makeRunCli`.
-- **Tooling cost:** `additionalProperties: false` is everywhere on
-  the agent profile, so the addition is mechanical. Schema-token
-  budget: one optional `session: string` per tool that gains it is
-  negligible (the budget is enforced by `tokens.ts`).
-- **Concurrent A/B sessions:** two stdio children, two `process.env`s,
-  each `tools/call` carries its own `session` arg, `resolveSession`
-  reads the flag first (per `packages/core/src/reach.ts:175-176`) and
-  falls back to env only if absent — so even if env is shared and
-  wrong, the explicit flag wins.
-
-**Status B:** viable. Smallest production change. Explicit. Auditable
-in the oplog. **CHOSEN.**
-
-### 3.3 Option C — Cline-side bridge
-
-- **Cardinality fits:** a ClineMM plugin that, on each session,
-  registers an MCP server with `env: { MYC_SESSION_ID: { value: <ctx.session.sessionId> } }`.
-  But the value indirection is `{ fromEnv, value, required }` — and
-  `fromEnv` does not help here because `process.env.MYC_SESSION_ID`
-  is not set; only `value` works, but `value` is read **once** by
-  `resolvePluginMcpEnv` when the manager processes the registration —
-  i.e., per *plugin load*, not per *session*. The registration is
-  read from a static `cline_mcp_settings.json` (or the plugin
-  manifest). A bridge plugin could re-register a fresh MCP server
-  per session, but that adds an entirely new MCP lifecycle to manage
-  inside ClineMM, and ClineMM does not yet expose a hook for "session
-  started, please inject MCP env into the spawn".
-
-**Status C:** not viable today. Requires ClineMM-side plumbing that
-does not exist. Defer until either Cline exposes a way for plugins
-to re-register MCP servers per session, or we accept running our own
-MCP server outside of `cline_mcp_settings.json`. **NOT chosen.**
-
-### 3.4 Phase 3 verdict
+The reviewer proposed a third path:
 
 ```text
-PREFERRED_SESSION_TRANSPORT = B (additive per-call 'session' argument
-                                on the mutation tools that need it;
-                                today: myc_remember)
-
-REJECTED_TRANSPORTS         = A  (blocked: ClineMM doesn't mutate
-                                  process.env per session)
-                                C  (blocked: registration env is
-                                  resolved once, not per session)
+A2  per-session MCP child + session-aware env materialization
+    (MYC_SESSION_ID=<ctx.session.sessionId> injected at spawn)
 ```
 
-A *combination* is also possible later: do B today, layer C (or A)
-on top once Cline exposes a session-env hook. That ordering is the
-minimum-friction path; B is a single small, additive, audit-friendly
-change.
+with two variants:
 
-**Status.** Phase 3 = SHIPPED_AND_PROVEN. Transport B is selected.
+- **A2a (generic):** extend `AgentExtensionMcpEnvValue`
+  (`shared/extensions/contribution-registry.ts:57-64`) with a new
+  `{ fromSession: "sessionId" }` indirection, and add a ClineMM
+  materialization step between `loadConfiguredMcpTools` and
+  `StdioMcpClient.spawnProcess` that resolves `fromSession` against
+  the live `ctx.session.sessionId`. This is a generic ClineMM
+  feature, not myc-specific.
+- **A2b (small):** have ClineMM automatically inject
+  `CLINE_SESSION_ID=<sessionId>` into every local stdio MCP
+  child's env, and add `CLINE_SESSION_ID` to
+  `SESSION_ENV_KEYS` in `packages/core/src/reach.ts:59-67`.
+  Smaller, but couples myc to Cline-specific naming.
+
+### 3.1 Option A2a — `fromSession` env indirection (CHOSEN, generic)
+
+- **Cardinality fits.** Phase 1 confirms one stdio child per
+  session per registered MCP server. The spawn env is already an
+  explicit per-call object.
+- **Myc side is unchanged.** `MYC_SESSION_ID` is already in
+  `SESSION_ENV_KEYS`; `resolveSession()` already reads it from
+  `process.env`; every command already does the right thing. No
+  schema or argv changes. Future myc tools inherit session identity
+  automatically.
+- **ClineMM change is small and generic.** One new optional field
+  in `AgentExtensionMcpEnvValue`, one new branch in
+  `resolvePluginMcpEnv`, plus threading `sessionId` from the
+  runtime-builder through the InMemoryMcpManager into the per-child
+  spawn. The runtime builder is already session-scoped
+  (line 540 + line 556 `registryKey = config.sessionId || ...`),
+  so the seam is reachable.
+- **Concurrent A/B sessions.** Two stdio children, two distinct
+  spawn envs, two distinct `MYC_SESSION_ID` values. Phase 2's
+  isolation invariants fall out for free; `visibleInPrime`
+  evaluates `info.session === current` and gets the right answer.
+- **Visibility filtering parity.** `myc_prime` and `myc_recall`
+  read session from `process.env.MYC_SESSION_ID` exactly as
+  Claude Code does today; no schema or dispatch change required.
+
+**Status A2a:** viable, generic, zero myc production change,
+preserves the visibility invariant for every current and future
+myc tool.
+
+### 3.2 Option A2b — auto-inject `CLINE_SESSION_ID`
+
+- **Cardinality fits.** Same as A2a.
+- **Myc side change is small.** Add `CLINE_SESSION_ID` to
+  `SESSION_ENV_KEYS`. The flag chain stays unchanged.
+- **Generic concern.** Couples myc to Cline naming. Slight risk of
+  precedence collisions with a user-set `MYC_SESSION_ID` in their
+  shell env (the host spreads `...process.env` first, then
+  `transport.env` overrides — so `transport.env.MYC_SESSION_ID`
+  wins; this is *fine* if the Cline-side injection writes
+  `transport.env`, not `process.env`). Slightly more brittle than
+  A2a because every agent that wants this feature has to maintain
+  its own env-name mapping.
+
+**Status A2b:** viable as a fallback if ClineMM rejects the
+generic `fromSession` extension in code review. Smaller diff.
+
+### 3.3 Option B — additive per-call `session` argument (FALLBACK)
+
+- **Cardinality fits.** One tool call, one session argument.
+- **Myc side is not small.** To preserve the visibility invariant,
+  every tool that reads `resolveSession()` needs the argument:
+  `myc_remember`, `myc_prime`, `myc_recall`, `myc_review`. Any
+  future tool that reads reach inherits a maintenance contract.
+- **Tooling cost.** `additionalProperties: false` is enforced
+  across the agent profile; the addition is mechanical per-tool,
+  but the *list of tools* must be kept in sync with
+  `resolveSession` callers — perpetual schema-maintenance
+  invariant.
+- **Identity transport problem.** Someone has to populate the
+  `session` field on every tool call. That requires either an
+  LLM-instructed convention (fragile, the model has to remember to
+  copy an opaque identifier correctly) or a ClineMM
+  tool-call-interceptor mechanism. Either way, ClineMM has to do
+  the same plumbing it would do for A2 — just in a different
+  place. A2 is strictly less code than B + the interceptor.
+
+**Status B:** viable as a fallback if neither A2a nor A2b is
+acceptable upstream. More code than A2a, more failure modes.
+
+### 3.4 Option A1 — mutate ClineMM `process.env` per session (REJECTED)
+
+- The reviewer correctly noted this is **not** the same as A2.
+  A1 would write `process.env.MYC_SESSION_ID = sessionId` inside
+  ClineMM at session boundaries, polluting the host's environment
+  and racing with concurrent sessions.
+- Re-confirmed by grep over `sdk/packages/core/src/`: no
+  `process.env[key] = value` writes anywhere. A1 would be the
+  first such write.
+
+**Status A1:** REJECTED. A1 was the reason Transport A was
+originally rejected; that reason was correct for A1 and *only*
+A1. Transport A in general (per-session spawn env injection) is
+A2 and is the chosen path.
+
+### 3.5 Option C — Cline-side bridge plugin (REJECTED, unchanged)
+
+- `resolvePluginMcpEnv` reads `fromEnv`/`value` once at
+  registration load (`plugin-server-registration.ts:54-87`),
+  before any session exists. A bridge plugin that re-registers an
+  MCP server per session would need ClineMM to expose a
+  "session started" hook, which it does not. The static
+  `cline_mcp_settings.json` is one file, read once per runtime
+  build, and the `InMemoryMcpManager` is created inside that
+  build (`runtime-builder.ts:229-233`). No clean bridge surface
+  today.
+
+**Status C:** REJECTED. Unchanged from the original verdict.
+
+### 3.6 Phase 3 verdict (revised)
+
+```text
+PREFERRED_SESSION_TRANSPORT = A2a (per-session MCP child +
+                                  session-aware env materialization
+                                  via a new 'fromSession' field on
+                                  AgentExtensionMcpEnvValue,
+                                  resolved at spawn time from
+                                  ctx.session.sessionId)
+
+FALLBACK_TRANSPORT          = A2b (ClineMM auto-injects
+                                   CLINE_SESSION_ID; myc adds it to
+                                   SESSION_ENV_KEYS)
+
+SECONDARY_FALLBACK          = B  (additive per-call 'session'
+                                   argument on every myc tool that
+                                   reads resolveSession(), with a
+                                   ClineMM tool-call interceptor to
+                                   populate it from ctx.session)
+
+REJECTED_TRANSPORTS         = A1 (mutating ClineMM process.env
+                                   per session; races with
+                                   concurrent sessions)
+                                 C  (no per-session registration
+                                   hook exists in ClineMM)
+```
+
+### 3.7 Phase 1 phrase correction
+
+The Phase 1 verdict line `MCP_PROCESS_ENV_STATIC_OR_DYNAMIC =
+static at child spawn` and the pre-execution checkpoint line
+`CAN_EXISTING_MCP_CALL_CARRY_SESSION_ID = false (no schema key,
+no argv decoration, env is shared per host)` were misleading.
+The **host `process.env`** is shared per host, but the **per-child
+spawn env** is not inherently shared: each session has its own
+child process and therefore can receive a distinct env. The
+pre-execution checkpoint below records the corrected wording.
+
+**Status.** Phase 3 = SHIPPED_AND_PROVEN after revision. The
+revised verdict preserves Phases 1, 2, 4 unchanged and identifies
+A2a as the primary path, A2b as a smaller fallback, B as a deeper
+fallback, and A1/C as rejected.
 
 ---
 
@@ -567,33 +694,67 @@ CAN_SCHEMA_ASK_FOR_DYNAMIC_SESSION_ENV = false (no Cline-side hook
 ## Pre-execution checkpoint
 
 ```text
-MYC-CLINEMM01 / PRE-EXECUTION QUALIFICATION
+MYC-CLINEMM01 / PRE-EXECUTION QUALIFICATION (revised after review)
 
 CLINE_SESSION_ID_SOURCE              = ctx.session.sessionId
 TOP_LEVEL_CONCURRENT_SESSIONS        = supported (multiple per host process)
 SUBAGENT_CONCURRENT_SESSIONS         = supported (agents-squad)
 MCP_PROCESS_CARDINALITY              = one stdio child per session per registered MCP server
-MCP_PROCESS_ENV_STATIC_OR_DYNAMIC    = static at spawn (no per-session hook)
+MCP_PROCESS_ENV_STATIC_OR_DYNAMIC    = per-call object at spawn (each child
+                                       receives its own env object;
+                                       nothing forces it to be shared)
 CAN_EXISTING_MCP_CALL_CARRY_SESSION_ID = false (no schema key, no argv decoration,
-                                               env is shared per host)
-PREFERRED_SESSION_TRANSPORT          = B (additive per-call 'session' argument on
-                                       myc_remember today; other mutators as
-                                       Phase 2 evidence warrants)
-REJECTED_TRANSPORTS                  = A (blocked: ClineMM doesn't mutate
-                                         process.env per session),
-                                        C (blocked: plugin-server env is
-                                         resolved at registration load,
-                                         not per session)
+                                               no env mechanism ClineMM populates today)
+CAN_EXISTING_MCP_PROCESS_CARRY_SESSION_ID = true
+                                       (MCP process cardinality is
+                                       one_per_session_per_registration;
+                                       the per-child env object CAN carry
+                                       MYC_SESSION_ID — ClineMM today
+                                       lacks only the materialization path
+                                       from ctx.session.sessionId to that
+                                       env object)
+PREFERRED_SESSION_TRANSPORT          = A2a (per-session MCP child +
+                                        session-aware env materialization
+                                        via new 'fromSession' field on
+                                        AgentExtensionMcpEnvValue;
+                                        resolved at spawn from
+                                        ctx.session.sessionId;
+                                        zero myc production change)
+FALLBACK_TRANSPORTS                  = A2b (ClineMM auto-injects
+                                          CLINE_SESSION_ID; myc adds
+                                          CLINE_SESSION_ID to
+                                          SESSION_ENV_KEYS)
+                                        B   (additive per-call 'session'
+                                          argument on every myc tool that
+                                          reads resolveSession(), plus a
+                                          ClineMM tool-call interceptor;
+                                          perpetual schema-maintenance
+                                          contract)
+REJECTED_TRANSPORTS                  = A1 (mutating ClineMM process.env
+                                          per session; races with
+                                          concurrent sessions)
+                                        C   (no per-session registration
+                                          hook exists in ClineMM)
+MUTATIONS_REQUIRING_SESSION_TODAY    = [myc_remember writes session,
+                                         myc_prime reads session,
+                                         myc_recall reads session,
+                                         myc_review reads session for
+                                         audit]
+MUTATIONS_SAFE_WITHOUT_SESSION       = [myc_link, myc_ready claim,
+                                         myc_update]
 CLI_CONFIG_AUTHORITY                 = ~/.cline/data/settings/cline_mcp_settings.json
-                                       (CLI + IDE share; $CLINE_MCP_SETTINGS_PATH override)
+                                        (CLI + IDE share;
+                                        $CLINE_MCP_SETTINGS_PATH override)
 IDE_CONFIG_AUTHORITY                 = same file (no separate IDE config)
 WORKSPACE_OVERRIDES                   = none
-READY_FOR_PHASE5                     = true
-                                       (transport decision is fixed, and
-                                       Phase 5 only needs the build
-                                       environment; production changes
-                                       for B are scoped to MYC-CLINEMM02,
-                                       which Phase 5 still does not start)
+READY_FOR_PHASE5                     = true (transport decision is fixed,
+                                        Phase 5 still only needs the
+                                        build environment; A2a is
+                                        generic ClineMM plumbing and
+                                        is not started by CLINEMM01)
+READY_FOR_CLINEMM02                  = false (Phase 7 black-box red-test
+                                        under transport A2a has not run;
+                                        that is MYC-CLINEMM02's job)
 ```
 
 ---
@@ -603,10 +764,21 @@ READY_FOR_PHASE5                     = true
 Phase 5 must install Bun (the pinned 1.3.13 if reproducing ClineMM's
 engine) and run `bun install` + `bun run build` in the myc fork.
 Phases 6–12 then black-box-qualify the actual end-to-end behavior
-under the resolved environment.
+under the resolved environment, including verifying that
+`spawn(child, env.MYC_SESSION_ID=A)` and `spawn(child,
+env.MYC_SESSION_ID=B)` produce isolated `prime`/`recall` behavior
+under unmodified myc — the existing S58 model.
 
-No myc production change is implied by Phases 0–4. The additive
-`session` argument (Transport B) belongs to MYC-CLINEMM02, which is a
-separate task. This report's job ends at the checkpoint above.
+**Zero myc production change is implied by Phases 0–4.** The chosen
+path A2a is a generic ClineMM feature (a new optional
+`fromSession` field on `AgentExtensionMcpEnvValue` plus a
+materialization step in the runtime builder) — it is not myc-side
+work. A2b (the smaller fallback) is one extra line in
+`SESSION_ENV_KEYS`. B (the deeper fallback) would require
+production changes on both sides and is not the recommended path.
 
-— end of MYC-CLINEMM01 Phases 0–4 —
+The implementation of A2a (or whichever transport survives review)
+is the work of MYC-CLINEMM02, which is a separate task. This
+report's job ends at the checkpoint above.
+
+— end of MYC-CLINEMM01 Phases 0–4 (revised after review) —
