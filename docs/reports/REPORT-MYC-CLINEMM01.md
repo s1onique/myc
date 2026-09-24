@@ -680,11 +680,14 @@ the runtime session. If a second session-derived field is
 needed later, add it in its own CLINEMM-numbered decision with
 its own review; do not extend the enum in place.
 
-**3.8.4 Frozen A2a test matrix.** The following nine tests are
+**3.8.4 Frozen A2a test matrix.** The following nine tests
+(A2A-01 through A2A-09, with A2A-05 and A2A-09 each split into
+two named subcases a/b to cover both polarities) are
 non-negotiable for CLINEMM02; all nine must pass before
 `CLINEMM_SESSION_PROPAGATION = PASS` can be reported. The
 matrix is split between unit tests (CLINEMM-side) and
-integration tests (end-to-end with myc).
+integration tests (end-to-end with myc). The count of nine is
+fixed; subcases do not increase the count.
 
 ```text
 A2A-01  unit    { value: "foo" } resolves to env.FOO = "foo"
@@ -705,18 +708,42 @@ A2A-04  integ   two simultaneous sessions: child A's env has
                 MYC_SESSION_ID = B; the two values are not
                 equal
 
-A2A-05  unit    { fromSession: "sessionId", required: true }
-                and a runtime that has no session (e.g. an
+A2A-05a unit    { fromSession: "sessionId", required: true } and
+                a runtime that has no session (e.g. an
                 IDE-level MCP probe): loud failure at spawn,
-                not silent undefined
+                not silent undefined.
 
-A2A-06  unit    { value, fromEnv, fromSession } is rejected at
-                registration load (zero or multiple sources is
-                a configuration error)
-                AND { value: undefined } is rejected (zero
-                sources is a configuration error)
-                AND { required: true } alone with no source is
-                rejected
+A2A-05b unit    { fromSession: "sessionId", required: false } and
+                a runtime that has no session: spawn succeeds,
+                the child process is started, and the resolved
+                env object does NOT contain a MYC_SESSION_ID
+                key (the key is omitted entirely, not set to
+                the empty string). This is the
+                "required=false + unresolved" branch of the
+                error matrix; without A2A-05b it would be
+                possible for an implementation to silently
+                inject an empty MYC_SESSION_ID, which would
+                itself be a Cline-session disclosure.
+
+A2A-06  unit    parameterize over the full ambiguity matrix;
+                every entry below MUST be rejected at
+                registration load with a configuration error
+                (not at spawn, not silently accepted):
+
+                  {}                            // zero sources
+                  { required: true }            // required only, no source
+                  { value, fromEnv }            // 2 sources
+                  { value, fromSession: "sessionId" }
+                  { fromEnv, fromSession: "sessionId" }
+                  { value, fromEnv, fromSession: "sessionId" }
+
+                The single test A2A-06 covers all six cases
+                and fails if any of them is not rejected.
+                This guards against an implementation that
+                only rejects "all three sources present" while
+                quietly allowing pairs, which would still
+                resolve to a value at spawn but with
+                undocumented precedence.
 
 A2A-07  integ   remote MCP servers (SSE / HTTP transports):
                 `fromSession` is rejected or no-op'd at spawn,
@@ -729,15 +756,41 @@ A2A-08  unit    cline_mcp_settings.json parser accepts the new
                 `fromSession` key in env values and round-trips
                 it through read/write without loss
 
-A2A-09  integ   an MCP server registered WITHOUT fromSession
-                receives no MYC_SESSION_ID at all (its env does
-                not include the session id). This is the
-                explicit-opt-in security boundary: Cline does
-                not implicitly leak session ids to every MCP
-                child. Tested by registering a dummy stdio
-                server with only a literal env, and asserting
-                process.env.MYC_SESSION_ID is undefined inside
-                the dummy's handler.
+A2A-09  integ   explicit-opt-in security boundary for session
+                disclosure. Two controlled-host subcases,
+                both required:
+
+                A2A-09a  Given a test process where
+                         host process.env.MYC_SESSION_ID is
+                         ABSENT, a server registered WITHOUT
+                         `fromSession` MUST end up with no
+                         MYC_SESSION_ID key in its child env.
+                         (Asserts Cline does not synthesize or
+                         inject the current Cline session id
+                         into a registration that did not opt
+                         in.)
+
+                A2A-09b  Given a test process where
+                         host process.env.MYC_SESSION_ID is
+                         already set to a sentinel value
+                         (e.g. "HOST") and a server is
+                         registered WITHOUT `fromSession` but
+                         WITH a literal env block that does not
+                         mention MYC_SESSION_ID, the child
+                         process inherits the host value
+                         ("HOST") unchanged. A2a MUST NOT
+                         overwrite an inherited host value with
+                         ctx.session.sessionId unless the
+                         registration explicitly opts in via
+                         `fromSession`.
+
+                Why both: A2A-09a proves no implicit disclosure.
+                A2A-09b proves no implicit OVERWRITE of an
+                unrelated, host-provided value. Either direction
+                of mutation without opt-in would be a contract
+                violation. (OS env inheritance itself is
+                documented and expected Cline behavior; A2a
+                is not in scope to suppress it.)
 ```
 
 The matrix is locked as written. CLINEMM02 may add tests, but
@@ -923,10 +976,16 @@ FROZEN_FROMSESSION_ENUM              = "sessionId" only (no
                                         preemptive generalization
                                         to workspaceRoot, cwd, etc.)
 FROZEN_TEST_MATRIX                   = [A2A-01, A2A-02, A2A-03,
-                                        A2A-04, A2A-05, A2A-06,
-                                        A2A-07, A2A-08, A2A-09]
-                                        (locked; CLINEMM02 may add
-                                        tests but may not drop or
+                                        A2A-04, A2A-05 {a,b},
+                                        A2A-06, A2A-07, A2A-08,
+                                        A2A-09 {a,b}]
+                                        (nine logical test ids;
+                                        A2A-05 and A2A-09 each
+                                        split into two named
+                                        subcases to cover both
+                                        polarities; locked;
+                                        CLINEMM02 may add tests
+                                        but may not drop or
                                         weaken any of these nine)
 ```
 
@@ -956,8 +1015,9 @@ under the resolved environment, split per §3.8.1:
   NOT_IMPLEMENTED. CLINEMM01 must not produce a PASS/FAIL here.
   CLINEMM02 flips this verdict by (1) implementing A2a in
   ClineMM, (2) running A2A-04 against the real runtime builder,
-  and (3) running A2A-01, A2A-02, A2A-03, A2A-05, A2A-06,
-  A2A-07, A2A-08, A2A-09 to fully close the test matrix.
+  and (3) running the rest of §3.8.4 — A2A-01, A2A-02, A2A-03,
+  A2A-05a, A2A-05b, A2A-06 (with all six ambiguity cases), A2A-07,
+  A2A-08, A2A-09a, A2A-09b — to fully close the test matrix.
 
 **Zero myc production change is implied by Phases 0–4.** The
 chosen path A2a is a generic ClineMM feature (a new optional
