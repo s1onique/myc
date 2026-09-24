@@ -396,8 +396,9 @@ The MCP server speaks the host's session lifecycle indirectly:
   (filesystem hook, PreCompact hook, SDK plugin) to trigger absorb.
 
 **Cline consequence.** If ClineMM can only be wired via the user-level
-`~/.cline/mcp.json` (the only supported configuration for Claude Code that
-the user pasted in), then **all four lifecycle events must come from Cline's
+`~/.cline/mcp.json` (the configuration authority for the **Cline CLI**
+that the user pasted in; the Cline IDE extension uses its own MCP
+settings JSON), then **all four lifecycle events must come from Cline's
 plugin/SDK API**, not from MCP. The MCP server will not know when context
 compaction happens. That means the ClineMM integration plugin has to
 trigger `myc prime` (beforeRun) AND `myc absorb-session` (PreCompact or
@@ -476,10 +477,16 @@ Why this is enough to start:
 - `myc mcp` does project discovery by `cwd` of the spawned process, which is
   the agent's working directory. In Cline that is the project root, so it
   will find `.myc/myc.db` by walking up.
-- The same definition works in ClineMM, Claude Code, opencode, Kimi, Codex -
-  the only consumer of the user-level MCP config.
-- One project, one `~/.cline/mcp.json`. To roll out across repos, you
-  `myc init` in each; nothing else.
+- The **same `command` + `args` definition** is portable across hosts: Cline
+  CLI, Cline IDE extension, Claude Code, opencode, Kimi, Codex. What is
+  *not* portable is the **configuration file authority**: the Cline CLI
+  uses `~/.cline/mcp.json`, the Cline IDE extension uses its own MCP
+  settings JSON, Claude Code uses `~/.claude.json` (or project-local
+  `.mcp.json`), and so on. CLINEMM01 Phase 4 must qualify these separately
+  for the actual ClineMM build; do not assume `~/.cline/mcp.json` is
+  authoritative everywhere.
+- One project, one `myc init`. To roll out across repos, run `myc init`
+  in each; nothing else.
 
 ### 8.2 What this gets us (and what it does NOT)
 
@@ -544,20 +551,31 @@ global `~/.cline/mcp.json` IS the wire.
 
 ### 8.4 When to modify ClineMM (the actual integration plugin)
 
-Only after the manual pilot confirms the MCP tools behave. At that point:
+Only after MYC-CLINEMM01 PASSes (session-identity qualification green), and
+*never* in a way that contradicts §3.2.1. At that point:
 
 - A small ClineMM plugin that, on `beforeRun`, calls `myc_prime` and
   injects its result as the first user-context block.
-- A wrapper or instruction that passes `--session <cline-session-id>` to
-  every MCP call (the easiest is to put it in the agent's tool-call
-  convention; Cline's SDK can decorate tool calls).
-- A `compaction boundary` hook that calls `myc absorb-session` with the
-  transcript and a budget. This is the single most important piece -
-  without it, S58 reach semantics become decorative.
+- Session identity propagation using whatever transport MYC-CLINEMM01
+  qualified (per-task MCP process, additive `session` MCP argument, or a
+  Cline-side bridge that wraps `myc` CLI with `MYC_SESSION_ID` set per
+  call). The lifecycle plugin **must not assume** the existing MCP tool
+  envelope accepts a per-call session argument — none of the current
+  `myc_*` schemas do, and every one of them declares
+  `additionalProperties: false`. Upstream Cline docs explicitly state a
+  single host process can run multiple sessions concurrently, so a
+  process-level env var (`MYC_SESSION_ID` set once at MCP server start)
+  is **not** sufficient on its own and must be combined with one of the
+  per-session mechanisms above.
+- A `compaction boundary` hook that calls `myc absorb-session` against
+  Cline's canonical persisted transcript (full-fidelity; compaction state
+  is kept separately by Cline). This is the single most important piece
+  — without it, S58 reach semantics become decorative.
 - An `afterRun` hook that calls `myc close-session` to finalize the
   session's pending jobs.
 
-We do NOT add lifecycle logic to myc - we only consume the existing tools.
+We do NOT add lifecycle logic to myc — we only consume the existing tools,
+subject to the qualified transport from CLINEMM01.
 
 ### 8.5 What should go into MYC-CLINEMM01/02 milestones
 
