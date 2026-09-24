@@ -604,6 +604,151 @@ revised verdict preserves Phases 1, 2, 4 unchanged and identifies
 A2a as the primary path, A2b as a smaller fallback, B as a deeper
 fallback, and A1/C as rejected.
 
+### 3.8 Frozen contract (added after second review)
+
+A second reviewer accepted A2a but asked for three concrete
+additions: (a) split the qualification oracle so CLINEMM01 can
+prove myc's side without A2a existing yet, (b) freeze a
+precedence rule for `AgentExtensionMcpEnvValue`, and (c)
+enumerate the tests that must exist before A2a ships. This
+subsection freezes those decisions.
+
+**3.8.1 Qualification-oracle split.** The end-to-end question
+"does Cline carry session into myc?" decomposes into two
+independently falsifiable claims:
+
+- `MYC_ENV_SESSION_ISOLATION` — *"If a stdio child is launched
+  with `MYC_SESSION_ID=A`, unmodified myc satisfies S58 in a
+  way that A and B are mutually isolated."* This is a property
+  of the modified myc binary under a chosen env, and is
+  provable from CLINEMM01 by launching two MCP children by hand
+  (`MYC_SESSION_ID=A ./dist/myc mcp --profile agent` and
+  `MYC_SESSION_ID=B ./dist/myc mcp --profile agent`) once
+  Phase 5 builds `dist/myc`.
+
+- `CLINEMM_SESSION_PROPAGATION` — *"If a Cline session has a
+  given `sessionId`, ClineMM materializes that id into the
+  per-MCP-child env as `MYC_SESSION_ID`."* This is a property
+  of the ClineMM runtime builder, and is provable only after
+  A2a is implemented (CLINEMM02).
+
+Until CLINEMM02 ships, `CLINEMM_SESSION_PROPAGATION =
+NOT_IMPLEMENTED` is the correct verdict; reporting
+`SESSION_ID_PROPAGATION = PASS` from CLINEMM01 alone would be
+false-positive evidence because manually setting
+`MYC_SESSION_ID` only proves the oracle, not the propagation.
+
+**3.8.2 Precedence rule for `AgentExtensionMcpEnvValue`.** The
+field set today is `{ value, fromEnv, required }`; A2a adds
+`fromSession`. To avoid ambiguous objects and the test matrix
+explosion that follows them, the contract is:
+
+```text
+source-of-truth   : value XOR fromEnv XOR fromSession
+                    (exactly one of the three must be present;
+                    none or more than one is a configuration
+                    error)
+
+required          : orthogonal boolean (applies regardless of
+                    which source is selected)
+
+error mode        : configuration with zero sources -> fail to
+                    load the registration
+                    configuration with multiple sources -> fail
+                    to load the registration
+                    configuration with a source that resolves
+                    to undefined and required=true -> fail at
+                    spawn time
+                    configuration with a source that resolves
+                    to undefined and required=false -> spawn
+                    with the key absent
+```
+
+The disallow-multiple-sources rule means each of the four
+candidate fields is testable in isolation: tests do not need
+to enumerate `{value, fromEnv} × {value, fromSession} × …`
+combinations, only `{value} ∪ {fromEnv} ∪ {fromSession} ×
+{required}`, which is six cases instead of dozens. Precedence
+is therefore a non-ambiguity guarantee, not an ordering rule.
+
+**3.8.3 Narrow `fromSession` enum.** Ship exactly
+`fromSession?: "sessionId"`. Do not preemptively generalize to
+`"workspaceRoot"`, `"cwd"`, `"userId"`, etc. The narrow cap is
+a security contract: it makes it obvious from reading a
+configuration file whether a field can leak information about
+the runtime session. If a second session-derived field is
+needed later, add it in its own CLINEMM-numbered decision with
+its own review; do not extend the enum in place.
+
+**3.8.4 Frozen A2a test matrix.** The following nine tests are
+non-negotiable for CLINEMM02; all nine must pass before
+`CLINEMM_SESSION_PROPAGATION = PASS` can be reported. The
+matrix is split between unit tests (CLINEMM-side) and
+integration tests (end-to-end with myc).
+
+```text
+A2A-01  unit    { value: "foo" } resolves to env.FOO = "foo"
+                (regression guard: A2a must not break existing
+                value-only configurations)
+
+A2A-02  unit    { fromEnv: "FOO" } resolves to env.FOO = the
+                host's process.env.FOO at spawn time
+                (regression guard: existing fromEnv path still
+                works under the new precedence rule)
+
+A2A-03  unit    { fromSession: "sessionId" } resolves to
+                env.MYC_SESSION_ID = ctx.session.sessionId at
+                spawn time
+
+A2A-04  integ   two simultaneous sessions: child A's env has
+                MYC_SESSION_ID = A; child B's env has
+                MYC_SESSION_ID = B; the two values are not
+                equal
+
+A2A-05  unit    { fromSession: "sessionId", required: true }
+                and a runtime that has no session (e.g. an
+                IDE-level MCP probe): loud failure at spawn,
+                not silent undefined
+
+A2A-06  unit    { value, fromEnv, fromSession } is rejected at
+                registration load (zero or multiple sources is
+                a configuration error)
+                AND { value: undefined } is rejected (zero
+                sources is a configuration error)
+                AND { required: true } alone with no source is
+                rejected
+
+A2A-07  integ   remote MCP servers (SSE / HTTP transports):
+                `fromSession` is rejected or no-op'd at spawn,
+                because the child process lives on a remote
+                host and session scoping there is a different
+                problem. Cline-side decision: server is rejected
+                from the active set, with a clear error message.
+
+A2A-08  unit    cline_mcp_settings.json parser accepts the new
+                `fromSession` key in env values and round-trips
+                it through read/write without loss
+
+A2A-09  integ   an MCP server registered WITHOUT fromSession
+                receives no MYC_SESSION_ID at all (its env does
+                not include the session id). This is the
+                explicit-opt-in security boundary: Cline does
+                not implicitly leak session ids to every MCP
+                child. Tested by registering a dummy stdio
+                server with only a literal env, and asserting
+                process.env.MYC_SESSION_ID is undefined inside
+                the dummy's handler.
+```
+
+The matrix is locked as written. CLINEMM02 may add tests, but
+must not drop or weaken these nine.
+
+**Status.** Phase 3 frozen additions = SHIPPED_AND_PROVEN. No
+further redesign of the transport architecture is permitted
+before Phase 5/6 produces falsifying evidence. If Phase 5/6
+falsifies any of the §3.8 commitments, that is a new decision,
+not a quiet re-edit.
+
 ---
 
 ## Phase 4 — ClineMM MCP configuration authority
@@ -752,9 +897,37 @@ READY_FOR_PHASE5                     = true (transport decision is fixed,
                                         build environment; A2a is
                                         generic ClineMM plumbing and
                                         is not started by CLINEMM01)
-READY_FOR_CLINEMM02                  = false (Phase 7 black-box red-test
-                                        under transport A2a has not run;
-                                        that is MYC-CLINEMM02's job)
+READY_FOR_CLINEMM02                  = false (A2a not implemented;
+                                        CLINEMM02 starts it)
+MYC_ENV_SESSION_ISOLATION_TARGET     = PASS|FAIL (Phase 7 oracle: two
+                                        hand-spawned myc MCP children
+                                        with MYC_SESSION_ID=A and
+                                        MYC_SESSION_ID=B satisfy S58
+                                        under unmodified myc)
+CLINEMM_SESSION_PROPAGATION_TARGET    = NOT_IMPLEMENTED
+                                        (only flips to PASS|FAIL after
+                                        CLINEMM02 ships A2a and runs
+                                        A2A-04 against the real
+                                        runtime builder; CLINEMM01
+                                        must not produce a verdict
+                                        here)
+ENV_VALUE_PRECEDENCE                 = value XOR fromEnv XOR fromSession
+                                        (exactly one source;
+                                        zero or multiple sources is
+                                        a registration-load error)
+ENV_VALUE_REQUIRED                   = orthogonal boolean (applies
+                                        regardless of which source is
+                                        selected; required+undefined
+                                        source at spawn -> fail)
+FROZEN_FROMSESSION_ENUM              = "sessionId" only (no
+                                        preemptive generalization
+                                        to workspaceRoot, cwd, etc.)
+FROZEN_TEST_MATRIX                   = [A2A-01, A2A-02, A2A-03,
+                                        A2A-04, A2A-05, A2A-06,
+                                        A2A-07, A2A-08, A2A-09]
+                                        (locked; CLINEMM02 may add
+                                        tests but may not drop or
+                                        weaken any of these nine)
 ```
 
 ---
@@ -764,21 +937,40 @@ READY_FOR_CLINEMM02                  = false (Phase 7 black-box red-test
 Phase 5 must install Bun (the pinned 1.3.13 if reproducing ClineMM's
 engine) and run `bun install` + `bun run build` in the myc fork.
 Phases 6–12 then black-box-qualify the actual end-to-end behavior
-under the resolved environment, including verifying that
-`spawn(child, env.MYC_SESSION_ID=A)` and `spawn(child,
-env.MYC_SESSION_ID=B)` produce isolated `prime`/`recall` behavior
-under unmodified myc — the existing S58 model.
+under the resolved environment, split per §3.8.1:
 
-**Zero myc production change is implied by Phases 0–4.** The chosen
-path A2a is a generic ClineMM feature (a new optional
-`fromSession` field on `AgentExtensionMcpEnvValue` plus a
-materialization step in the runtime builder) — it is not myc-side
-work. A2b (the smaller fallback) is one extra line in
+- **Phase 7 oracle (`MYC_ENV_SESSION_ISOLATION`).** Launch two
+  MCP children by hand:
+
+  ```bash
+  MYC_SESSION_ID=A ./dist/myc mcp --profile agent
+  MYC_SESSION_ID=B ./dist/myc mcp --profile agent
+  ```
+
+  and prove that A remembers A, B remembers B, A's prime/recall
+  sees only A, B's prime/recall sees only B, and project-reach
+  memory is visible to both. This is a property of unmodified
+  myc under a chosen env. CLINEMM01 owns this verdict.
+
+- **Phase 7 propagation oracle (`CLINEMM_SESSION_PROPAGATION`).**
+  NOT_IMPLEMENTED. CLINEMM01 must not produce a PASS/FAIL here.
+  CLINEMM02 flips this verdict by (1) implementing A2a in
+  ClineMM, (2) running A2A-04 against the real runtime builder,
+  and (3) running A2A-01, A2A-02, A2A-03, A2A-05, A2A-06,
+  A2A-07, A2A-08, A2A-09 to fully close the test matrix.
+
+**Zero myc production change is implied by Phases 0–4.** The
+chosen path A2a is a generic ClineMM feature (a new optional
+`fromSession: "sessionId"` field on `AgentExtensionMcpEnvValue`
+plus a materialization step in the runtime builder) — it is not
+myc-side work. A2b (the smaller fallback) is one extra line in
 `SESSION_ENV_KEYS`. B (the deeper fallback) would require
-production changes on both sides and is not the recommended path.
+production changes on both sides and is not the recommended
+path.
 
-The implementation of A2a (or whichever transport survives review)
-is the work of MYC-CLINEMM02, which is a separate task. This
-report's job ends at the checkpoint above.
+The implementation of A2a (and the running of the §3.8.4 test
+matrix) is the work of MYC-CLINEMM02, which is a separate task.
+This report's job ends at the checkpoint above.
 
-— end of MYC-CLINEMM01 Phases 0–4 (revised after review) —
+— end of MYC-CLINEMM01 Phases 0–4 (revised after review, frozen
+contract §3.8) —
