@@ -3061,7 +3061,7 @@ http://192.168.1.14:7788/#t=myc_v_9c31aa…
 | существующий `.myc/` | не трогаем, печатаем состояние и выходим 0 (идемпотентность) |
 | `.beads/` | предлагаем `myc import --from beads` (не выполняем без согласия) |
 | `graft/` или `graft` в PATH | включаем адаптер, ставим job `graft map` для L2-карты репозитория |
-| `.claude/`, `.codex/`, `opencode.json`, `.cursor/`, `AGENTS.md` | список для `myc wire` (не пишем без `--yes` или `myc wire`) |
+| `.claude/`, `.codex/`, `opencode.json`, `.cursor/`, `.kimi-code/`, `.mimocode/`, `.minimax/`, `AGENTS.md` | список для `myc wire` (не пишем без `--yes` или `myc wire`) |
 | `package.json`/`go.mod`/`Cargo.toml`/`pyproject.toml` | язык → стартовый словарь тегов |
 | `ANTHROPIC_API_KEY`/`OPENAI_API_KEY` в env | предлагаем включить `llm.chat` (не включаем сами) |
 | `.gitignore` | дописываем 4 строки в свой блок с маркерами |
@@ -3317,7 +3317,7 @@ p99 на 100k и обязан сообщить `degraded[]`, если верну
 | HTTP API | `myc serve` | — | Bearer (+ опц. trusted proxy) | да |
 | Proxy | `myc proxy` | выключен по умолчанию | пробрасывает ключ upstream | да, бюджет 15 мс |
 | Веб | `myc viz` | read-write / read-only / share | Bearer или локальный | нет |
-| Хуки | генерируются `myc wire` | claude / codex / opencode | — | да (post-edit < 2 мс) |
+| Хуки | генерируются `myc wire` | claude / codex / opencode / kimi / mcode / mimo | — | да (post-edit < 2 мс) |
 
 ## Приложение B. Сводка бюджетов L3
 

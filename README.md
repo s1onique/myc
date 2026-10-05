@@ -57,8 +57,8 @@ Install Bun: https://bun.sh
 Installation is one command:
 
 ```bash
-bun install -g @aistastudio/myc   # 5.11 MB compressed, 15.80 MB unpacked, 16 files; no models pulled
-myc --version                     # myc 0.4.3 (schema 1)
+bun install -g @aistastudio/myc   # 5.11 MB compressed, 15.82 MB unpacked, 16 files; no models pulled
+myc --version                     # myc 0.4.4 (schema 1)
 ```
 
 It runs on macOS and Linux. On Windows, use WSL and install Bun and myc inside
@@ -90,7 +90,7 @@ source build, `./dist/myc` instead of `myc`.)
 
 ```bash
 myc init                     # .myc/ + SQLite + migrations in this repo
-myc wire                     # hooks + MCP for Claude Code, Codex, opencode and Kimi
+myc wire                     # hooks + MCP for Claude Code, Codex, opencode, Kimi, mcode and mimo
 myc ready --claim            # take the next task
 myc show <id>                # all that is known about it
 myc close <id>
@@ -466,8 +466,9 @@ last-writer-wins over whole records.
 
 **Guards are proved by mutation.** Every refusal and every invariant is
 accompanied by a mutation that removes it; a guard whose removal breaks no test
-is treated as absent. The full suite: 4192 pass / 0 fail / 16 skip
-(`bun test`, 2026-10-02).
+is treated as absent. The full suite: 4209 pass / 1 fail / 16 skip
+(`bun test`, 2026-10-04; the fail is the orca status-line classifier test
+against the installed Orca.app chunks).
 
 ## What myc does
 

@@ -301,6 +301,7 @@ describe("схема", () => {
       { version: 7, name: "swarm_attempt_run_session" },
       { version: 8, name: "harness_codex" },
       { version: 9, name: "swarm_attempt_scope" },
+      { version: 10, name: "harness_mcode_mimo" },
     ]);
   });
 
@@ -613,5 +614,105 @@ describe("миграция 9: происхождение scope и снимок �
       old.query("SELECT sql FROM sqlite_master WHERE name = 'swarm_attempt'").get() as { sql: string }
     ).sql;
     for (const source of SCOPE_SOURCES) expect(sql).toContain(`'${source}'`);
+  });
+});
+
+/**
+ * ОБНОВЛЕНИЕ БАЗЫ ВЕРСИИ 9 (миграция 10). Перестройка копирует строки
+ * `SELECT *` — позиция в позицию, колонка в колонку: если CREATE
+ * перечислит колонки миграции 009 не в том порядке, в каком их физически
+ * добавило ADD COLUMN, число колонок совпадёт, ошибки не будет, а значения
+ * тихо поедут. Поэтому база доводится до версии 9, наполняется — включая
+ * predicted_class, scope_source и git_base, — и только потом накатывается 10.
+ *
+ * PRAGMA foreign_keys = ON — та же причина, что в описании миграции 8:
+ * без включённых ключов неверный порядок DROP прошёл бы молча.
+ */
+describe("миграция 10: перестройка под mcode и mimo на базе версии 9", () => {
+  let old: Database;
+  let oldDir: string;
+
+  beforeEach(() => {
+    oldDir = mkdtempSync(join(tmpdir(), "myc-swarm-v9-"));
+    old = new Database(join(oldDir, "myc.db"), { create: true });
+    old.exec("PRAGMA journal_mode = WAL");
+    old.exec("PRAGMA foreign_keys = ON");
+    ensureSwarmSchema(
+      old,
+      swarmMigrations.filter((m) => m.version <= 9),
+    );
+    old
+      .query(
+        `INSERT INTO swarm_model (model_id, family, harness, created_at, updated_at)
+         VALUES ('p/m', 'm', 'kimi', 1, 1)`,
+      )
+      .run();
+    old
+      .query(
+        `INSERT INTO swarm_attempt (attempt_id, task_id, model_id, harness, task_class,
+                                    started_at, predicted_class, scope_source)
+         VALUES ('att_000000000010', 'memory-1', 'p/m', 'kimi', 'fix:module',
+                 10, 'fix:module', 'touched')`,
+      )
+      .run();
+    old
+      .query(
+        `INSERT INTO swarm_attempt_run (attempt_id, git_head, git_base, recorded_at)
+         VALUES ('att_000000000010', 'abc', '{"root":"/w"}', 10)`,
+      )
+      .run();
+  });
+
+  afterEach(() => {
+    old.close();
+    rmSync(oldDir, { recursive: true, force: true });
+  });
+
+  test("колонки 009 пережили перестройку на своих позициях", () => {
+    ensureSwarmSchema(old);
+    expect(old.query("SELECT * FROM swarm_attempt").get()).toMatchObject({
+      attempt_id: "att_000000000010",
+      harness: "kimi",
+      task_class: "fix:module",
+      predicted_class: "fix:module",
+      scope_source: "touched",
+    });
+    expect(old.query("SELECT * FROM swarm_attempt_run").get()).toMatchObject({
+      attempt_id: "att_000000000010",
+      git_head: "abc",
+      git_base: '{"root":"/w"}',
+    });
+    expect(old.query("PRAGMA foreign_key_check").all()).toEqual([]);
+  });
+
+  test("временных таблиц не осталось, индексы на месте, CHECK знает новых", () => {
+    ensureSwarmSchema(old);
+    const names = (
+      old.query("SELECT name FROM sqlite_master WHERE type = 'table'").all() as Array<{
+        name: string;
+      }>
+    ).map((r) => r.name);
+    expect(names.filter((n) => n.endsWith("_pre10"))).toEqual([]);
+    for (const index of ["swarm_attempt_task", "swarm_attempt_arm", "swarm_attempt_run_session"]) {
+      expect(
+        old.query("SELECT name FROM sqlite_master WHERE type = 'index' AND name = ?1").get(index),
+      ).not.toBeNull();
+    }
+    for (const harness of ["mcode", "mimo"]) {
+      old
+        .query(
+          `INSERT INTO swarm_model (model_id, family, harness, created_at, updated_at)
+           VALUES (?1, 'f', ?2, 1, 1)`,
+        )
+        .run(`p/${harness}`, harness);
+    }
+    expect(() =>
+      old
+        .query(
+          `INSERT INTO swarm_model (model_id, family, harness, created_at, updated_at)
+           VALUES ('p/ghost', 'f', 'ghost', 1, 1)`,
+        )
+        .run(),
+    ).toThrow(/CHECK constraint failed/);
   });
 });

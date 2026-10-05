@@ -96,11 +96,13 @@ const EXCEPTIONS: readonly Exception[] = [
   { file: "packages/cli/src/statusline-session.samples.ts", symbol: "MCP_SAMPLES", reason: SAMPLES_REASON },
   { file: "packages/cli/src/statusline-session.samples.ts", symbol: "CLI_SAMPLES", reason: SAMPLES_REASON },
   // --- тела генерируемых helper'ов: только комментарии ---------------------
-  ...["GENERATED", "BIN_LOOKUP", "claudeHelper", "codexHelper", "opencodePlugin", "kimiHelper"].map((symbol) => ({
-    file: "packages/cli/src/hooks/templates.ts",
-    symbol,
-    reason: HELPER_REASON,
-  })),
+  ...["GENERATED", "BIN_LOOKUP", "claudeHelper", "codexHelper", "opencodeFamilyPlugin", "kimiHelper", "mcodeHelper"].map(
+    (symbol) => ({
+      file: "packages/cli/src/hooks/templates.ts",
+      symbol,
+      reason: HELPER_REASON,
+    }),
+  ),
 ];
 
 // ---------------------------------------------------------------------------

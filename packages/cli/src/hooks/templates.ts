@@ -648,11 +648,11 @@ process.exit(0);
  * остаётся страховкой и пишет эпизод, если основной не отработал. Двойной
  * записи нет: страховка смотрит на отметку `handled`.
  */
-export function opencodePlugin(opts: HelperOptions): string {
+function opencodeFamilyPlugin(opts: HelperOptions, agent: string, relPath: string): string {
   const sessionStart = opts.events.includes("session-start");
   const preCompact = opts.events.includes("pre-compact");
   const postEdit = opts.events.includes("post-edit");
-  return `// .opencode/plugin/myc.ts — ${GENERATED}.
+  return `// ${relPath} — ${GENERATED}.
 //
 // Правило то же, что у helper'ов Claude Code, Codex и Kimi: myc НИКОГДА не
 // валит сессию агента. Любая ошибка, любой таймаут, отсутствие бинаря —
@@ -681,7 +681,7 @@ const run = async (args: string[], ms: number, ev: string, stdin?: string): Prom
       stdin: stdin === undefined ? "ignore" : new TextEncoder().encode(stdin),
       stdout: "pipe",
       stderr: "ignore",
-      env: { ...process.env, MYC_HOOK: ev, MYC_HOOK_AGENT: "opencode" },
+      env: { ...process.env, MYC_HOOK: ev, MYC_HOOK_AGENT: ${JSON.stringify(agent)} },
     });
     const timer = setTimeout(() => {
       try {
@@ -756,7 +756,7 @@ const absorb = async (client: any, sessionID: string): Promise<string> =>
       "--budget",
       "1200",
       "--agent",
-      "opencode",
+      ${JSON.stringify(agent)},
       "--session",
       sessionID,
       "--hook-output",
@@ -855,6 +855,40 @@ export const MycPlugin = async ({ client, directory }: { client: any; directory?
   };
 };
 `;
+}
+
+export function opencodePlugin(opts: HelperOptions): string {
+  return opencodeFamilyPlugin(opts, "opencode", ".opencode/plugin/myc.ts");
+}
+
+/**
+ * MiMo Code (`.mimocode/plugin/myc.ts`) — то же тело, что у opencode.
+ *
+ * mimo — ФОРК opencode, и здесь это не аналогия, а прочитанный факт
+ * (бинарь @mimo-ai/mimocode-darwin-arm64 0.1.15 плюс исходники
+ * XiaomiMiMo/MiMo-Code на теге v0.1.15):
+ *
+ * 1. ШИНА СОБЫТИЙ ОДНА В ОДИН: `experimental.chat.system.transform`,
+ *    `experimental.session.compacting`, `session.compacted`,
+ *    `tool.execute.after`, `client.session.messages` — всё, на что
+ *    опирается шаблон выше, в бинаре mimo есть; `appendContext`
+ *    отсутствует (0 вхождений), как и у opencode — дверь в контекст та же.
+ * 2. ПЛАГИН АВТОЗАГРУЖАЕТСЯ ИЗ `.mimocode/plugin/`: ConfigPlugin.load
+ *    гоняет `{plugin,plugins}/*.{ts,js}` по каталогам конфига, а
+ *    ConfigPaths.directories ведёт проектный `.mimocode` вверх от cwd до
+ *    worktree — отдельная запись в mimocode.json не нужна. Проверено
+ *    живым прогоном: `mimo debug config` в изолированном проекте показал
+ *    файл из `.mimocode/plugin/` в разрешённом списке `plugin[]`.
+ * 3. Скиллы проекта mimo читает из `.mimocode/skills/<имя>/SKILL.md`
+ *    (и `.mimocode/skill/`), фронтматтер name+description — общий с Claude
+ *    Code формат, конфиг
+ *    проекта — `.mimocode/mimocode.json`; это planMimo ставит рядом.
+ *
+ * Агент в атрибутах эпизода — `mimo` (MYC_HOOK_AGENT и `--agent`): имя
+ * попадает в ростер той же миграцией CHECK, что и mcode.
+ */
+export function mimoPlugin(opts: HelperOptions): string {
+  return opencodeFamilyPlugin(opts, "mimo", ".mimocode/plugin/myc.ts");
 }
 
 /**
@@ -1320,6 +1354,169 @@ export function kimiHooksToml(events: readonly HookEvent[]): string {
   }
   lines.push("# myc:kimi:end");
   return lines.join("\n");
+}
+
+export const MCODE_HELPER_REL = ".minimax/myc-hooks.mjs";
+
+/**
+ * Что ставится mcode (`.minimax/myc-hooks.mjs` + плагин для человека).
+ *
+ * Всё ниже установлено ЧТЕНИЕМ бинаря @minimax-ai/code 0.6.2
+ * (`~/.minimax-code/releases/0.6.2/lib`, chunks) и его README/CHANGELOG, а
+ * не догадкой по имени харнесса:
+ *
+ * 1. ХУКИ У MCODE ЖИВУТ ТОЛЬКО В ПЛАГИНАХ. Регистр возможностей внутри
+ *    бинаря прямо говорит: standalone user hooks — `status: "retired"`,
+ *    «Custom hooks belong to Plugins». Проектных плагинов нет:
+ *    `scanLocalPackages()` сканирует ЕДИНСТВЕННЫЙ каталог
+ *    `join(dataDir, "plugins")` — это `~/.minimax/plugins`
+ *    (MINIMAX_DATA_DIR ?? ~/.minimax, symlink ~/.mavis). Поэтому, как у
+ *    Kimi, wire ставит исполняемую половину — helper в проекте — и печатает
+ *    готовые файлы плагина, которые человек один раз кладёт себе в
+ *    `~/.minimax/plugins/myc/`.
+ * 2. МАНИФЕСТ mcode читает трёх видов: свой `plugin.json`, а также
+ *    `.claude-plugin/plugin.json` и `.codex-plugin/plugin.json`. Берём
+ *    CLAUDE-формат: хуки лежат в `hooks/hooks.json` (defaultPath
+ *    загрузчика), форма записи — та же, что у настроек Claude Code.
+ * 3. СОБЫТИЯ ЕСТЬ: полный список событий бинаря (`npe`) содержит
+ *    SessionStart, SessionEnd, UserPromptSubmit, PreToolUse, PostToolUse,
+ *    Stop, SubagentStart, SubagentStop, PreCompact, PostCompact. Событий
+ *    ДВА — session-start и pre-compact — по той же причине, что у Codex и
+ *    Kimi: post-edit не ставится, пока форма tool_input mcode не подтверждена
+ *    чтением (хук, который не сработает, хуже отсутствующего).
+ * 4. ВЫХОД SessionStart: разрешённый набор ключей (функция BJe,
+ *    sourceFormat CLAUDE) включает `hookSpecificOutput`, а разбор
+ *    additionalContext отдельной функцией (LJe) совпадает с Claude Code —
+ *    поэтому вывод myc заворачивается в additionalContext, как у Codex.
+ * 5. ВЫХОД PreCompact: набор ключей — continue/stopReason/suppressOutput/
+ *    systemMessage/terminalSequence плюс decision/reason; канала для
+ *    контекста НЕТ, а неверный JSON уходит в разбор решений (перед
+ *    сжатием мcode проверяет decision.continue). Значит вывод absorb-session
+ *    на pre-compact helper молча отбрасывает: эпизод уже записан самим
+ *    absorb (побочный эффект), а спасательный пакет контекст не примет —
+ *    это свойство харнесса, а не упущение wire.
+ * 6. ВХОД: у CLAUDE-формата исполнитель требует transcriptPath на входе
+ *    (проверка в FSn: `sourceFormat==="CLAUDE" && transcriptPath==null`
+ *    валит запуск хука), а PreCompact обязан содержать `trigger` — поля
+ *    приходят в snake_case, как у Claude Code: session_id, transcript_path,
+ *    cwd, trigger. Аргументы ниже написаны под эту схему.
+ * 7. Таймаут в записи хука — секунды (как у Claude Code и Kimi).
+ */
+const MCODE_EVENTS: ReadonlyMap<HookEvent, ClaudeEvent> = new Map([
+  ["session-start", "SessionStart"],
+  ["pre-compact", "PreCompact"],
+]);
+
+/**
+ * Команда для печатаемого hooks/hooks.json: относительная (cwd хука —
+ * проект) и под защитой существования файла: плагин-то пользовательский,
+ * а проект может быть без wire — чужая сессия не должна спотыкаться.
+ */
+function mcodeHookCommand(event: HookEvent): string {
+  return (
+    `if [ -f ${MCODE_HELPER_REL} ]; then node ${MCODE_HELPER_REL} ${event}; ` +
+    "else cat >/dev/null 2>&1 || true; fi"
+  );
+}
+
+export function mcodeHelper(opts: HelperOptions): string {
+  const wanted = [...MCODE_EVENTS.keys()];
+  const specs = HOOK_SPECS.filter((s) => opts.events.includes(s.event) && wanted.includes(s.event));
+  const limits = specs.map((s) => `  "${s.event}": ${s.innerMs},`).join("\n");
+  const args = specs
+    .map((s) =>
+      s.event === "session-start"
+        ? `  "session-start": ["prime", "--budget", "2000", "--format", "agent", "--session", payload.session_id ?? ""],`
+        : `  "pre-compact": ["absorb-session", "--reason", payload.trigger ?? "auto", "--transcript", payload.transcript_path ?? "-", "--budget", payload.trigger === "manual" ? "2000" : "1200", "--agent", "mcode", "--session", payload.session_id ?? "", "--hook-output", "text"],`,
+    )
+    .join("\n");
+  return `#!/usr/bin/env node
+// ${MCODE_HELPER_REL} — ${GENERATED}.
+//
+// Правило то же, что у helper'ов Claude Code, Codex и Kimi: myc НИКОГДА не
+// валит сессию агента. Любая ошибка, любой таймаут, отсутствие бинаря —
+// выход 0 и пустой stdout. Кодом 2 mcode блокирует ход, поэтому им мы не
+// выходим никогда.
+import { spawnSync } from "node:child_process";
+import { existsSync, readFileSync } from "node:fs";
+import { join } from "node:path";
+
+const EV = process.argv[2];
+
+let payload = {};
+try {
+  payload = JSON.parse(readFileSync(0, "utf8") || "{}");
+} catch {}
+
+// mcode кладёт cwd проекта в payload (runEvent передаёт его отдельным
+// полем); нет его — работаем из текущего каталога.
+const DIR = typeof payload.cwd === "string" && payload.cwd ? payload.cwd : process.cwd();
+
+const LIMIT = {
+${limits}
+}[EV] ?? 2000;
+
+${BIN_LOOKUP}
+
+const ARGS = {
+${args
+  .split("\n")
+  .map((l) => `  ${l.trim()}`)
+  .join("\n")}
+}[EV];
+
+if (!ARGS) process.exit(0);
+
+try {
+  const r = spawnSync(bin(), ARGS, {
+    cwd: DIR,
+    timeout: LIMIT,
+    encoding: "utf8",
+    maxBuffer: 8 * 1024 * 1024,
+    env: { ...process.env, MYC_HOOK: EV, MYC_HOOK_AGENT: "mcode" },
+  });
+  // SessionStart: контекст у mcode только через hookSpecificOutput
+  // (набор ключей CLAUDE-формата), обычный текст он не подмешивает.
+  if (EV === "session-start" && r.status === 0 && r.stdout && r.stdout.trim()) {
+    process.stdout.write(
+      JSON.stringify({
+        hookSpecificOutput: { hookEventName: "SessionStart", additionalContext: r.stdout },
+      }) + "\\n",
+    );
+  }
+  // pre-compact: stdout НЕ печатаем — у PreCompact у mcode нет канала для
+  // контекста, а неразобранный JSON идёт в разбор решений перед сжатием.
+} catch {}
+
+process.exit(0);
+`;
+}
+
+/**
+ * Два файла, которые печатает planMcode для ручной установки плагина в
+ * `~/.minimax/plugins/myc/`. Форма — CLAUDE-совместимая (см. докстроку
+ * MCODE_EVENTS): манифест с обязательным name, хуки — в hooks/hooks.json,
+ * который загрузчик берёт по умолчанию, если манифест не указал путь.
+ */
+export function mcodePluginFiles(opts: HelperOptions): { manifest: string; hooks: string } {
+  const byEvent: Record<string, unknown[]> = {};
+  for (const spec of HOOK_SPECS) {
+    if (!opts.events.includes(spec.event) || !MCODE_EVENTS.has(spec.event)) continue;
+    const claudeEvent = MCODE_EVENTS.get(spec.event)!;
+    const timeout = Math.max(1, Math.ceil(spec.timeoutMs / 1000));
+    const entry: Record<string, unknown> = {
+      hooks: [{ type: "command", command: mcodeHookCommand(spec.event), timeout }],
+    };
+    if (spec.matcher !== undefined) entry["matcher"] = spec.matcher;
+    byEvent[claudeEvent] = [entry];
+  }
+  const manifest = JSON.stringify(
+    { name: "myc", version: "1", description: "MiniMax Code hooks for the myc workspace" },
+    null,
+    2,
+  );
+  const hooks = JSON.stringify({ hooks: byEvent }, null, 2);
+  return { manifest, hooks };
 }
 
 /** Вся инструкция агенту живёт в скилле, а не в CLAUDE.md (D10). */

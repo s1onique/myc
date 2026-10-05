@@ -904,6 +904,171 @@ describe("kimi", () => {
 });
 
 /**
+ * MiMo Code (mimo, форк opencode). Что он читает — документация mimo,
+ * исходники XiaomiMiMo/MiMo-Code (тег v0.1.15) и живые прогоны
+ * `mimo debug skill` / `mimo debug config` в изолированном проекте;
+ * здесь закреплены ровно те факты, на которые опирается planMimo.
+ */
+describe("mimo", () => {
+  test("--agents mimo пишет только под .mimocode и не трогает чужого", async () => {
+    const r = await myc("wire", "--agents", "mimo");
+    expect(r.code).toBe(0);
+    expect(has(".mimocode/skills/myc/SKILL.md")).toBe(true);
+    expect(has(".mimocode/plugin/myc.ts")).toBe(true);
+    expect(has(".mimocode/mimocode.json")).toBe(true);
+    // Попросили одного mimo: ни чужих конфигов, ни общего .mcp.json.
+    expect(has(".claude/settings.json")).toBe(false);
+    expect(has(".mcp.json")).toBe(false);
+    expect(has("opencode.json")).toBe(false);
+    expect(has(".minimax/skills/myc/SKILL.md")).toBe(false);
+    expect(has("CLAUDE.md")).toBe(false);
+  });
+
+  test("MCP-запись в форме opencode, схема — только в созданном нами файле", async () => {
+    await myc("wire", "--agents", "mimo");
+    const cfg = JSON.parse(read(".mimocode/mimocode.json"));
+    expect(cfg["$schema"]).toBe("https://mimo.xiaomi.com/mimocode/config.json");
+    expect(cfg.mcp.myc).toEqual({
+      type: "local",
+      command: ["myc", "mcp", "--profile", "agent"],
+      enabled: true,
+    });
+  });
+
+  test("повторный wire не трогает чужой конфиг проекта, а наш — идемпотентен", async () => {
+    write(
+      ".mimocode/mimocode.json",
+      `${JSON.stringify({ $schema: "https://mimo.xiaomi.com/mimocode/config.json", share: "manual" }, null, 2)}\n`,
+    );
+    const before = read(".mimocode/mimocode.json");
+    const r = await myc("wire", "--agents", "mimo");
+    expect(r.code).toBe(0);
+    const once = read(".mimocode/mimocode.json");
+    expect(JSON.parse(once)).toMatchObject({ share: "manual", mcp: { myc: { type: "local" } } });
+    // Чужой узел сохранён, схема не подделана заново.
+    expect(JSON.parse(before)["mcp"]).toBeUndefined();
+    await myc("wire", "--agents", "mimo");
+    expect(read(".mimocode/mimocode.json")).toBe(once);
+  });
+
+  test("плагин — тело opencode с агентом mimo и своим заголовком", async () => {
+    await myc("wire", "--agents", "mimo");
+    const plugin = read(".mimocode/plugin/myc.ts");
+    expect(plugin).toContain("// .mimocode/plugin/myc.ts —");
+    expect(plugin).toContain('MYC_HOOK_AGENT: "mimo"');
+    // absorb-вызов в шаблоне построчный: "--agent" и имя — соседние строки.
+    expect(plugin).toMatch(/"--agent",\s+"mimo"/);
+    expect(plugin).toContain('"experimental.chat.system.transform"');
+    expect(plugin).toContain('"experimental.session.compacting"');
+    expect(plugin).toContain('"session.compacted"');
+    // Плагин не роняет сессию: весь его код — под try/catch (как у opencode).
+    expect(plugin).toContain("export const MycPlugin");
+  });
+
+  test("unwire снимает файлы и пустый .mimocode целиком", async () => {
+    await myc("wire", "--agents", "mimo");
+    expect(has(".mimocode/mimocode.json")).toBe(true);
+    expect((await myc("unwire")).code).toBe(0);
+    expect(has(".mimocode")).toBe(false);
+    expect(has(".mimocode/skills/myc/SKILL.md")).toBe(false);
+    expect(has(".mimocode/plugin/myc.ts")).toBe(false);
+  });
+});
+
+/**
+ * MiniMax Code (mcode). Факты — из бинаря @minimax-ai/code 0.6.2, его
+ * README/CHANGELOG и `mcode --help`; здесь закреплены ровно те из них, на
+ * которых стоит planMcode: свой скилл-каталог, общий .mcp.json и хуки,
+ * живущие только в пользовательских плагинах.
+ */
+describe("mcode", () => {
+  test("--agents mcode пишет только своё и берёт общий .mcp.json", async () => {
+    const r = await myc("wire", "--agents", "mcode");
+    expect(r.code).toBe(0);
+    expect(has(".minimax/skills/myc/SKILL.md")).toBe(true);
+    expect(has(".minimax/myc-hooks.mjs")).toBe(true);
+    // Единственная проектная дверь MCP у mcode — корневой .mcp.json.
+    expect(has(".mcp.json")).toBe(true);
+    // Чужого не тронули.
+    expect(has(".claude/settings.json")).toBe(false);
+    expect(has(".codex/config.toml")).toBe(false);
+    expect(has("opencode.json")).toBe(false);
+    expect(has(".mimocode")).toBe(false);
+    expect(has("CLAUDE.md")).toBe(false);
+  });
+
+  test("MCP-запись в форме, которую mcode разбирает (mcpServers + {command, args})", async () => {
+    await myc("wire", "--agents", "mcode");
+    const mcp = JSON.parse(read(".mcp.json"));
+    expect(typeof mcp.mcpServers.myc.command).toBe("string");
+    expect(mcp.mcpServers.myc.args).toEqual(["mcp", "--profile", "agent"]);
+  });
+
+  test("claude и mcode дают журналу одну запись на .mcp.json, а не две", async () => {
+    const r = await myc("wire", "--agents", "claude,mcode", "--json");
+    expect(r.code).toBe(0);
+    const data = JSON.parse(r.stdout as string).data as {
+      actions: { path: string }[];
+      journal?: { entries: { path: string }[] };
+    };
+    const planned = data.actions.filter((a) => a.path === ".mcp.json");
+    expect(planned.length).toBe(1);
+    const journal = readWireJournal(join(dir, ".myc", "wire.json"));
+    const recorded = (journal?.entries ?? []).filter((e) => e.path === ".mcp.json");
+    expect(recorded.length).toBe(1);
+    // И файл после прогона цел: оба харнесса видят один узел myc.
+    const mcp = JSON.parse(read(".mcp.json"));
+    expect(mcp.mcpServers.myc.args).toEqual(["mcp", "--profile", "agent"]);
+  });
+
+  test("helper оборачивает вывод старта в additionalContext, а сжатие не молчит вхолостую", async () => {
+    await myc("wire", "--agents", "mcode");
+    const helper = read(".minimax/myc-hooks.mjs");
+    expect(helper).toContain('MYC_HOOK_AGENT: "mcode"');
+    expect(helper).toContain('"--agent", "mcode"');
+    expect(helper).toContain('"--hook-output", "text"');
+    // Форма вывода SessionStart у mcode — CLAUDE (hookSpecificOutput).
+    expect(helper).toContain('hookEventName: "SessionStart"');
+    expect(helper).toContain("additionalContext: r.stdout");
+    // У PreCompact у mcode нет канала для контекста: вывод отбрасывается,
+    // и helper не может выйти кодом 2 (блокирует ход агента).
+    expect(helper).not.toContain("process.exit(2)");
+    expect(helper).toContain('EV === "session-start"');
+  });
+
+  test("про плагин в ~/.minimax/plugins сказано вслух — с файлами и секундами", async () => {
+    const r = await myc("wire", "--agents", "mcode", "--json");
+    expect(r.code).toBe(0);
+    const note = (JSON.parse(r.stdout as string).data as { notes: string[] }).notes.join("\n");
+    expect(note).toContain("~/.minimax/plugins/myc/.claude-plugin/plugin.json");
+    expect(note).toContain("~/.minimax/plugins/myc/hooks/hooks.json");
+    // Манифест обязателен: name — обязательное поле CLAUDE-формы.
+    expect(note).toContain('"name": "myc"');
+    expect(note).toContain('"SessionStart"');
+    expect(note).toContain('"PreCompact"');
+    expect(note).toContain("manual|auto");
+    // Таймаут у mcode в СЕКУНДАХ (как у Claude Code): 3 и 8, не 3000/8000.
+    expect(note).toContain('"timeout": 3');
+    expect(note).toContain('"timeout": 8');
+    expect(note).not.toContain('"timeout": 3000');
+    // Команда относительная и под защитой: плагин пользовательский,
+    // проект может быть без wire.
+    expect(note).toContain("if [ -f .minimax/myc-hooks.mjs ]");
+  });
+
+  test("unwire снимает свои файлы и пустый .minimax, чужой .mcp.json — по узлам", async () => {
+    write(".mcp.json", `${JSON.stringify({ mcpServers: { foreign: { command: "other" } } }, null, 2)}\n`);
+    await myc("wire", "--agents", "mcode");
+    expect(JSON.parse(read(".mcp.json")).mcpServers.foreign).toEqual({ command: "other" });
+    expect((await myc("unwire")).code).toBe(0);
+    // Чужой узел остался, наш снят, каталог опустел.
+    expect(JSON.parse(read(".mcp.json")).mcpServers).toEqual({ foreign: { command: "other" } });
+    expect(has(".minimax")).toBe(false);
+    expect(has(".minimax/myc-hooks.mjs")).toBe(false);
+  });
+});
+
+/**
  * Строка статуса Claude Code — опция `--status-line` (без флага statusLine не
  * трогается, решение задачи memory-fbzbw5pexjs7). Прежняя действующая строка
  * — проектная, иначе пользовательская — продолжает получать тот же ввод, а
@@ -1045,6 +1210,16 @@ describe("строка статуса: --status-line", () => {
     expect(notes).toContain("Codex: status line not installed");
     expect(notes).toContain("opencode: status line not installed");
     expect(notes).toContain("Kimi: this version of wire does not install the status line");
+    expect(notes).toContain("only for Claude Code");
+    expect(has(".claude/settings.json")).toBe(false);
+  });
+
+  test("mcode, mimo: строку не ставим — и говорим это, а не молчим", async () => {
+    const r = await sl(slRegistry(), "wire", "--agents", "mcode,mimo", "--status-line", "--json");
+    expect(r.code).toBe(0);
+    const notes = (JSON.parse(r.stdout as string).data as { notes: string[] }).notes.join("\n");
+    expect(notes).toContain("mcode: status line not installed");
+    expect(notes).toContain("mimo: status line not installed");
     expect(notes).toContain("only for Claude Code");
     expect(has(".claude/settings.json")).toBe(false);
   });

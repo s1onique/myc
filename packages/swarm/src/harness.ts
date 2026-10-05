@@ -23,9 +23,10 @@
  * Добавление харнесса — это ВСЕГДА две правки: строка здесь и миграция роя,
  * расширяющая CHECK на swarm_model.harness / swarm_attempt.harness (текст
  * применённой миграции заморожен чек-суммой и правке не подлежит; см.
- * migrations/008-harness-codex.ts как образец перестройки таблицы).
+ * migrations/008-harness-codex.ts как образец перестройки таблицы, 010 —
+ * тот же образец с колонками миграции 009).
  * Забудешь вторую — roster.test.ts («CHECK схемы принимает ровно
  * HARNESSES») покажет это на первом же прогоне.
  */
-export const HARNESSES = ["claude", "codex", "opencode", "kimi"] as const;
+export const HARNESSES = ["claude", "codex", "opencode", "kimi", "mcode", "mimo"] as const;
 export type Harness = (typeof HARNESSES)[number];

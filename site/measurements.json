@@ -327,7 +327,7 @@
   "package": {
     "command": "bun run pack:npm",
     "compressed_mb": 5.11,
-    "unpacked_mb": 15.8,
+    "unpacked_mb": 15.82,
     "files": 16,
     "install_command": "bun install -g @aistastudio/myc",
     "model": {
@@ -337,8 +337,8 @@
       "source": "docs/reports/REPORT-npm-package.md",
       "measured_here": false
     },
-    "version": "0.4.3",
-    "date": "2026-10-02"
+    "version": "0.4.4",
+    "date": "2026-10-04"
   },
   "roadmap": {
     "command": "bun run site/roadmap.ts",
@@ -1032,9 +1032,9 @@
         "items": [
           {
             "since": "0.1.0",
-            "cmd": "myc wire --agents claude,codex,opencode,kimi",
-            "en": "One command wires hooks, the MCP server and the skill for Claude Code, Codex and opencode — and Kimi since 0.2.0. JSON configs are merged node by node with a backup; <code>CLAUDE.md</code> is never touched.",
-            "ru": "Одна команда ставит хуки, MCP-сервер и скилл для Claude Code, Codex и opencode — и для Kimi с 0.2.0. JSON-конфиги сливаются по узлам с резервной копией; <code>CLAUDE.md</code> не трогается никогда."
+            "cmd": "myc wire --agents claude,codex,opencode,kimi,mcode,mimo",
+            "en": "One command wires hooks, the MCP server and the skill for Claude Code, Codex, opencode, Kimi — and MiniMax Code (mcode) and MiMo Code (mimo) from the same list. JSON configs are merged node by node with a backup; <code>CLAUDE.md</code> is never touched.",
+            "ru": "Одна команда ставит хуки, MCP-сервер и скилл для Claude Code, Codex, opencode, Kimi — и для MiniMax Code (mcode) и MiMo Code (mimo) из того же списка. JSON-конфиги сливаются по узлам с резервной копией; <code>CLAUDE.md</code> не трогается никогда."
           },
           {
             "since": "0.1.0",
@@ -1604,14 +1604,15 @@
   },
   "tests": {
     "command": "bun test",
-    "pass": 4192,
-    "fail": 0,
+    "pass": 4209,
+    "fail": 1,
     "skip": 16,
     "files": 277,
-    "assertions": 38650,
-    "seconds": 462.08,
-    "sources": "ca03059aaa7e3781",
-    "date": "2026-10-02",
-    "myc": "0.4.3"
+    "assertions": 38164,
+    "seconds": 449.81,
+    "sources": "64aa0c78834dfa2c",
+    "date": "2026-10-04",
+    "myc": "0.4.4",
+    "failing_test": "классификатор orca > перенос совпадает с установленным кодом orca"
   }
 }

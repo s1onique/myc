@@ -65,6 +65,10 @@ import {
   HOOK_SPECS,
   kimiHelper,
   kimiHooksToml,
+  MCODE_HELPER_REL,
+  mcodeHelper,
+  mcodePluginFiles,
+  mimoPlugin,
   opencodePlugin,
   opencodeUserPlugin,
   skillMd,
@@ -142,6 +146,8 @@ const TOML_MCP_START = "# myc:mcp:start";
 const TOML_MCP_END = "# myc:mcp:end";
 /** Схему пишем только в созданный нами opencode.json — и снимаем вместе с ним. */
 const OPENCODE_SCHEMA = "https://opencode.ai/config.json";
+/** То же для .mimocode/mimocode.json (mimo читает его как проектный конфиг). */
+const MIMOCODE_SCHEMA = "https://mimo.xiaomi.com/mimocode/config.json";
 
 /**
  * Кого обслуживаем — ОДИН список на весь myc (@myc/swarm, harness.ts).
@@ -859,6 +865,26 @@ function planMcpServer(plan: Plan, o: WireOptions, rel: string, existing: unknow
   return fresh;
 }
 
+/**
+ * Корневой `.mcp.json` — общий файл проектного MCP: его читают Claude Code,
+ * Kimi и mcode (README mcode: «Runtime автоматически загружает .mcp.json из
+ * основного рабочего каталога сессии»). Форма у всех одна и та же —
+ * `mcpServers.myc`, узел один, поэтому харнессов, ставящих его, за прогон
+ * может быть несколько, а планировать файл положено ровно один раз: два
+ * действия на один путь дали бы две одинаковые записи в журнале, и
+ * `unwire` снимал бы узел дважды.
+ */
+function planRootMcp(plan: Plan, o: WireOptions): void {
+  if (plan.actions.some((a) => a.path === ".mcp.json")) return;
+  planJsonMerge(plan, o.root, ".mcp.json", (source) => {
+    const value = { ...source.value };
+    const servers = asRecord(value["mcpServers"]);
+    servers["myc"] = planMcpServer(plan, o, ".mcp.json", servers["myc"]);
+    value["mcpServers"] = servers;
+    return { nodes: ["mcpServers.myc"], conflicts: [], value };
+  });
+}
+
 function planClaude(plan: Plan, o: WireOptions): void {
   const specs = HOOK_SPECS.filter((s) => o.events.includes(s.event));
   const settings = ".claude/settings.json";
@@ -885,13 +911,7 @@ function planClaude(plan: Plan, o: WireOptions): void {
         "every project; with --queue-hook the hook asks instead, otherwise remove it by hand (wire does not write there)",
     );
   }
-  planJsonMerge(plan, o.root, ".mcp.json", (source) => {
-    const value = { ...source.value };
-    const servers = asRecord(value["mcpServers"]);
-    servers["myc"] = planMcpServer(plan, o, ".mcp.json", servers["myc"]);
-    value["mcpServers"] = servers;
-    return { nodes: ["mcpServers.myc"], conflicts: [], value };
-  });
+  planRootMcp(plan, o);
   plan.untouched.push("CLAUDE.md");
   if (o.statusLine) {
     plan.untouched.push(".claude/settings.local.json", "~/.claude/settings.json (read only)");
@@ -1229,6 +1249,95 @@ function planKimi(plan: Plan, o: WireOptions): void {
 }
 
 /**
+ * MiMo Code (`mimo`, @mimo-ai/cli — форк opencode). Что он читает —
+ * установлено документацией mimo.xiaomi.com/mimocode (skills, config-files,
+ * config-overrides), исходниками XiaomiMiMo/MiMo-Code на теге v0.1.15 и
+ * живыми прогонами бинаря 0.1.15 (`mimo debug skill`, `mimo debug config`
+ * в изолированном проекте), а не догадкой:
+ *
+ *   - Скиллы проекта: `.mimocode/skills/<имя>/SKILL.md` (и `.mimocode/skill/`),
+ *     фронтматтер name+description — общий формат, skillMd() подходит как
+ *     есть. Проверено прогоном debug skill: файл в `.mimocode/skills/`
+ *     попал в выдачу. Внешние брендовые каталоги (.claude/.codex/.opencode)
+ *     у mimo ВЫКЛЮЧЕНЫ по умолчанию (MIMOCODE_ENABLE_*_SKILLS), поэтому
+ *     скилл кладём только в СВОЙ каталог.
+ *   - Конфиг проекта: `.mimocode/mimocode.json` — именно так проектный
+ *     конфиг называет встроенная скилл-документация mimo; маркер в этом
+ *     файле появился в `mimo debug config`, вытеснив корневой mimocode.json.
+ *   - MCP: ключ `mcp` в формате opencode — {type:"local", command:[...],
+ *     enabled} (документация MCP); `$schema» пишем только в созданный нами
+ *     файл.
+ *   - Хуки: плагин `.mimocode/plugin/myc.ts`, автозагрузка каталога
+ *     подтверждена прогоном (файл из `.mimocode/plugin/` оказался в
+ *     resolved plugin[]); события те же, что у opencode — см. докстроку
+ *     mimoPlugin в templates.ts.
+ */
+function planMimo(plan: Plan, o: WireOptions): void {
+  if (o.statusLine) {
+    plan.notes.push(
+      "mimo: status line not installed — there is no config key for it, the TUI draws its own line",
+    );
+  }
+  planOwnFile(plan, o.root, ".mimocode/skills/myc/SKILL.md", skillMd());
+  planOwnFile(
+    plan,
+    o.root,
+    ".mimocode/plugin/myc.ts",
+    mimoPlugin({ events: o.events, hookOutput: o.hookOutput }),
+  );
+  planJsonMerge(plan, o.root, ".mimocode/mimocode.json", (source) => {
+    const value = { ...source.value };
+    if (!source.exists) value["$schema"] = MIMOCODE_SCHEMA;
+    const mcp = asRecord(value["mcp"]);
+    mcp["myc"] = { type: "local", command: ["myc", "mcp", "--profile", "agent"], enabled: true };
+    value["mcp"] = mcp;
+    return { nodes: ["mcp.myc"], conflicts: [], value };
+  });
+}
+
+/**
+ * MiniMax Code (`mcode`, @minimax-ai/code). Факты — из бинаря 0.6.2
+ * (`~/.minimax-code/releases/0.6.2/lib`), README/CHANGELOG пакета и
+ * `mcode --help`, а не по имени харнесса:
+ *
+ *   - Скиллы проекта: `walkUp` от каталога сессии ищет `.minimax/skills`
+ *     (приоритет 65), `.claude/skills` (60) и `.agents/skills`; внешние
+ *     источники включены по умолчанию (`external.enabled: true, walkUp:
+ *     true` в дефолтах конфига). СВОЙ каталог — `.minimax/skills`, чужие
+ *     (.claude) не занимаем.
+ *   - MCP: корень сессии, файл `.mcp.json` — единственная проектная дверь
+ *     (CHANGELOAD: «Automatically load project MCP servers from .mcp.json»).
+ *     Форма — `mcpServers` c {command, args}: разборчик принимает и обёртку,
+ *     и голую карту, верхние ключи — $schema/mcpServers. Это тот же файл,
+ *     что у Claude Code, — общий узел planRootMcp, а не вторая копия.
+ *   - Хуки: ТОЛЬКО пользовательские плагины (standalone hooks retired),
+ *     проектных плагинов mcode не читает. Поэтому, как у Kimi, wire ставит
+ *     helper (`.minimax/myc-hooks.mjs`) и печатает готовые файлы плагина
+ *     для `~/.minimax/plugins/myc/` — каталог сканируется при старте
+ *     (scanLocalPackages), отдельная команда установки не нужна.
+ *   - Статус-строки нет — замечаем, а не ставим молча.
+ */
+function planMcode(plan: Plan, o: WireOptions): void {
+  planOwnFile(plan, o.root, ".minimax/skills/myc/SKILL.md", skillMd());
+  planOwnFile(plan, o.root, MCODE_HELPER_REL, mcodeHelper({ events: o.events, hookOutput: o.hookOutput }));
+  planRootMcp(plan, o);
+  if (o.statusLine) {
+    plan.notes.push(
+      "mcode: status line not installed — this version of wire knows no mcode config key for it",
+    );
+  }
+  const files = mcodePluginFiles({ events: o.events, hookOutput: o.hookOutput });
+  plan.notes.push(
+    "mcode reads hooks only from user-level plugins (~/.minimax/plugins — MINIMAX_DATA_DIR ?? " +
+      "~/.minimax); wire does not write outside the project. The skill, MCP and the helper are in " +
+      "place; to also get prime at startup and an episode before compaction, create these two " +
+      "files once:\n" +
+      `  ~/.minimax/plugins/myc/.claude-plugin/plugin.json\n${files.manifest}\n\n` +
+      `  ~/.minimax/plugins/myc/hooks/hooks.json\n${files.hooks}`,
+  );
+}
+
+/**
  * Кто чем настраивается. Ключи — ВЕСЬ список харнессов и ровно он: тип
  * Record<Harness, …> не даст ни забыть нового, ни оставить выдуманного.
  */
@@ -1237,6 +1346,8 @@ const PLANNERS: Record<Harness, (plan: Plan, o: WireOptions) => void> = {
   codex: planCodex,
   opencode: planOpencode,
   kimi: planKimi,
+  mcode: planMcode,
+  mimo: planMimo,
 };
 
 function planAgentsMd(plan: Plan, o: WireOptions): void {
@@ -1670,7 +1781,8 @@ export function createWireCommand(registry: Registry, overrides: Partial<WireDep
   };
   return {
     name: "wire",
-    summary: "install myc hooks and MCP for Claude Code, Codex, opencode and Kimi without touching foreign files",
+    summary:
+      "install myc hooks and MCP for Claude Code, Codex, opencode, Kimi, MiniMax Code and MiMo Code without touching foreign files",
     flags: WIRE_FLAGS,
     help:
       "Writes only its own files in full (helper, skill, plugin); JSON configs are merged node by " +
@@ -2106,8 +2218,14 @@ export function createUnwireCommand(overrides: Partial<Pick<WireDeps, "env" | "p
             ? "; previous statusLine restored"
             : "";
         // В созданный нами opencode.json мы же положили и `$schema` — снимается с ним.
+        // То же для mimocode.json: остаток в виде голой схемы не пуст, и
+        // каталог `.mimocode` после снятия не удалился бы — wire оставлял бы
+        // мусор, которого до него не было.
         const rest = { ...stripped };
-        if (created && rest["$schema"] === OPENCODE_SCHEMA) delete rest["$schema"];
+        if (created) {
+          const schema = rest["$schema"];
+          if (schema === OPENCODE_SCHEMA || schema === MIMOCODE_SCHEMA) delete rest["$schema"];
+        }
         writeOrDrop(serializeJson(stripped, source.indent), Object.keys(rest).length === 0, `${entry.nodes.join(", ")}${restored}`);
       }
 
