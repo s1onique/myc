@@ -149,9 +149,17 @@ CREATE TABLE nodes (
 -- (attrs.external_ref пишет myc import-beads: у записи чужого трекера
 -- идентичность даёт его id, а не текст — в beads две разные задачи имеют
 -- право на дословно одинаковые заголовок и тело). Миграция 9.
+-- РЕПЛИКА В ЭТОТ ДОМЕН НЕ ВХОДИТ (миграция 15, memory-rnavnw2zbf4y), и по той
+-- же причине, что ввезённое: два разных ответа вправе совпасть дословно —
+-- «ок», «сделал», один и тот же отчёт к двум задачам. Идентичность реплики
+-- даёт то, К ЧЕМУ она прицеплена (ребро replies_to), а не её текст, и
+-- положить это в хеш нельзя: он считается из колонок узла и обязан совпасть
+-- на всех репликах, а цель живёт в ребре. Прежде второй такой комментарий
+-- падал сырым `UNIQUE constraint failed` под кодом internal.unexpected.
 CREATE UNIQUE INDEX ux_nodes_content
     ON nodes(scope, kind, content_hash)
- WHERE deleted_at IS NULL AND json_extract(attrs,'$.external_ref') IS NULL;
+ WHERE deleted_at IS NULL AND json_extract(attrs,'$.external_ref') IS NULL
+   AND coalesce(json_extract(attrs,'$.type'),'') <> 'comment';
 
 -- на этом же индексе стоит идемпотентность повторного импорта. Четвёртая
 -- колонка ext_dup разводит тот случай, который CRDT отвергнуть не может:
@@ -167,6 +175,24 @@ CREATE INDEX ix_nodes_ready
     ON nodes(scope, priority, updated_at)
  WHERE kind='task' AND status='open' AND open_blockers=0 AND anc_blockers=0
    AND deleted_at IS NULL;
+
+-- Очередь РАБОТЫ: то же, но без контейнеров вех (memory-ghbe6hg7xm9e). Эпик
+-- нельзя взять, внутри него делать нечего, а дети при этом свободны — его
+-- строки в индекс не входят, и отсев в очереди поэтому бесплатен.
+--
+-- ОТДЕЛЬНЫЙ ИНДЕКС, А НЕ СУЖЕНИЕ ПРЕЖНЕГО, и это проверено: запрос выпущенного
+-- бинаря пинит `INDEXED BY ix_nodes_ready` и НЕ несёт нового условия, а SQLite
+-- требует, чтобы предикат частичного индекса следовал из WHERE запроса. Сузи
+-- прежний — и у каждого уже работающего рядом бинаря (соседний агент, хук,
+-- MCP-сервер) `myc ready` падает «no query solution». Прежние индексы снимет
+-- отдельная миграция, когда такие бинари уйдут (memory-00xk2m2sn3aj).
+--
+-- Выражение обязано повторять NOT_EPIC из packages/core/src/ready-queries.ts
+-- СИМВОЛ В СИМВОЛ — иначе применимость индекса не доказывается.
+CREATE INDEX ix_nodes_ready_work
+    ON nodes(scope, priority, updated_at)
+ WHERE kind='task' AND status='open' AND open_blockers=0 AND anc_blockers=0
+   AND deleted_at IS NULL AND coalesce(json_extract(attrs,'$.type'),'') <> 'epic';
 
 -- prime: L2+L3 по scope, по убыванию salience
 CREATE INDEX ix_nodes_prime
@@ -537,6 +563,15 @@ CREATE INDEX ix_nodes_ready_repo ON nodes(
   updated_at
 ) WHERE kind='task' AND status='open' AND open_blockers=0 AND anc_blockers=0
     AND deleted_at IS NULL;
+
+-- Та же пара к охвату репозитория: работа без контейнеров вех.
+CREATE INDEX ix_nodes_ready_work_repo ON nodes(
+  scope,
+  json_extract(attrs,'$.repo'),
+  priority,
+  updated_at
+) WHERE kind='task' AND status='open' AND open_blockers=0 AND anc_blockers=0
+    AND deleted_at IS NULL AND coalesce(json_extract(attrs,'$.type'),'') <> 'epic';
 
 -- ============================ 8.1.10 код-интеллект (И3, S52) ================
 -- Собственный текстовый индекс кода: graft опционален, без него всё работает.

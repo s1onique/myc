@@ -39,7 +39,14 @@
 //     ленивый колбэк, который НЕ вызывается, если триггер не сработал, — в этом
 //     вся экономия.
 
-import { defineQueries, historyClause, type DbDriver, type Layer } from "@myc/core";
+import {
+  defineQueries,
+  freshnessClockSql,
+  historyClause,
+  type DbDriver,
+  type Dialect,
+  type Layer,
+} from "@myc/core";
 import type { FtsCaller } from "./fts.ts";
 import {
   readOplogSeq,
@@ -767,112 +774,21 @@ function aclPredicate(owner: number): string {
 
 // ============================ часы свежести =================================
 
-/**
- * Ключи attrs, из которых складываются часы свежести. Пишет их
- * `myc import-beads`: время события в источнике (у задачи — «обновлена», у
- * комментария — только «создан») и метку собственной записи импорта.
- */
-export const FRESHNESS_ATTRS = {
-  sourceUpdated: "external_updated_at",
-  sourceCreated: "external_created_at",
-  synced: "external_synced_at",
-} as const;
+// Предикаты якорей — тоже в ядре (packages/core/src/anchors-predicates.ts):
+// их читает дайджест prime, а его скан исполняет ещё и сервер.
+export { anchorsAllLostSql, anchorsAlivePredicate, lostAnchorOwnersSql } from "@myc/core";
 
-/**
- * Допуск, в пределах которого `updated_at` после метки импорта — всё ещё
- * запись САМОГО импорта, а не правка в myc. Импорт берёт метку по тем же
- * часам, что уйдут в HLC операции (max(Date.now(), clock.state.ts)), прямо
- * перед записью; зазор до выпуска операции — микросекунды, при ожидании
- * чужой блокировки записи — секунды (busy_timeout ~5 с). Минута — запас в
- * 12 раз. Цена: правка в первую минуту после ввоза не освежает — на кванте
- * свежести в сутки (FRESHNESS_QUANTUM_MS) это не видно.
- */
-export const IMPORT_WRITE_SLACK_MS = 60_000;
+// Часы свежести живут в ядре (packages/core/src/freshness.ts): их считает и
+// очередь ready, чей реестр исполняет ещё и сервер. Реэкспорт — чтобы
+// вызывающие не переучивались из-за переезда.
+export {
+  FRESHNESS_ATTRS,
+  IMPORT_WRITE_SLACK_MS,
+  freshnessClock,
+  freshnessClockSql,
+  sourceCreatedAt,
+} from "@myc/core";
 
-const isClockValue = (v: unknown): v is number => typeof v === "number" && Number.isFinite(v);
-
-/**
- * ЧАСЫ СВЕЖЕСТИ УЗЛА — одно определение на все поверхности
- * (memory-khny4xb612m6): буст выдачи (boostOf), дата хита в search/recall (и
- * их --since/--until, --sort updated), слагаемое свежести очереди ready (S21,
- * в SQL — freshnessClockSql), шапка и поле updated у `myc show`.
- *
- *  - Свой узел: `updated_at`.
- *  - Ввезённый, и после записи импорта его НЕ правили: время события в
- *    источнике (`external_updated_at`, иначе `external_created_at`), но не
- *    позже `updated_at` — часы источника, убежавшие вперёд, не делают запись
- *    свежее момента, когда её записали сюда (min).
- *  - Ввезённый, и `updated_at` позже метки импорта больше чем на допуск —
- *    узел правили в myc (update, claim, close): часы — `updated_at`. Работа
- *    здесь обязана освежать: после переезда она идёт именно здесь.
- *
- * Метки импорта нет (ввезено до неё) — различить запись импорта и правку
- * нечем, и часы — время источника. Родную колонку не подменяем: это время
- * операции и её HLC, оплог не должен врать о записи.
- */
-export function freshnessClock(node: {
-  readonly updated_at: number;
-  readonly attrs: Readonly<Record<string, unknown>>;
-}): number {
-  // Порядок проверок — ровно тот же, что в freshnessClockSql: сначала «правили
-  // в myc» (тогда источник не нужен вовсе), потом время источника.
-  const w = node.updated_at;
-  const synced = node.attrs[FRESHNESS_ATTRS.synced];
-  if (isClockValue(synced) && w > synced + IMPORT_WRITE_SLACK_MS) return w;
-  const u = node.attrs[FRESHNESS_ATTRS.sourceUpdated];
-  if (isClockValue(u)) return Math.min(u, w);
-  const c = node.attrs[FRESHNESS_ATTRS.sourceCreated];
-  if (isClockValue(c)) return Math.min(c, w);
-  return w;
-}
-
-/**
- * Дата создания для показа — пара к часам свежести и из того же места: у
- * ввезённого — момент создания в источнике (`external_created_at`), не
- * позже записи сюда, у своего — `created_at`. Её печатают show и строки
- * search/recall, иначе карточка и выдача называли бы разный «created».
- */
-export function sourceCreatedAt(node: {
-  readonly created_at: number;
-  readonly attrs: Readonly<Record<string, unknown>>;
-}): number {
-  const src = node.attrs[FRESHNESS_ATTRS.sourceCreated];
-  return isClockValue(src) ? Math.min(src, node.created_at) : node.created_at;
-}
-
-/**
- * freshnessClock в SQL — для тех, кто считает свежесть в самом запросе
- * (скоринг очереди ready идёт одним сканом индекса и режется LIMIT'ом, там
- * TS не успевает). Равенство с TS-версией на каждом случае держит
- * freshness-source-time.test.ts. `json_type`, а не `typeof(json_extract)`:
- * JSON-true у SQLite извлекается как целое 1, а в TS это не число.
- *
- * Цена — на КАЖДОГО кандидата очереди, поэтому выражение собрано под неё:
- *  - свой узел (в тексте attrs нет ни одного `"external_`) отсекается
- *    `instr`, без разбора JSON;
- *  - «правили в myc» проверяется первым — тогда время источника не читается;
- *  - у ввезённого и не тронутого — четыре обращения к JSON (тип и значение
- *    метки, тип и значение времени источника); разбор attrs SQLite кеширует
- *    в пределах строки.
- * Вызывающий обязан вычислять выражение ОДИН раз на строку (у ready — через
- * `CASE <возраст в сутках> WHEN …`, где база CASE считается однажды).
- */
-export function freshnessClockSql(alias: string): string {
-  const a = `${alias}.attrs`;
-  const w = `${alias}.updated_at`;
-  const isNum = (key: string): string => `json_type(${a},'$.${key}') IN ('integer','real')`;
-  const val = (key: string): string => `json_extract(${a},'$.${key}')`;
-  const U = FRESHNESS_ATTRS.sourceUpdated;
-  const C = FRESHNESS_ATTRS.sourceCreated;
-  const S = FRESHNESS_ATTRS.synced;
-  return `(CASE
-      WHEN instr(${a}, '"external_') = 0 THEN ${w}
-      WHEN ${isNum(S)} AND ${w} > ${val(S)} + ${IMPORT_WRITE_SLACK_MS} THEN ${w}
-      WHEN ${isNum(U)} THEN min(${val(U)}, ${w})
-      WHEN ${isNum(C)} THEN min(${val(C)}, ${w})
-      ELSE ${w}
-    END)`;
-}
 
 /**
  * Состояния якорей узла одной строкой `state:drift[,state:drift…]` — сырьё
@@ -895,50 +811,8 @@ export function anchorStatesSql(alias: string): string {
     END`;
 }
 
-/**
- * «ВСЕ якоря знания потеряны» — строка `lost` таблицы §7.3: «вес × 0.2, не
- * попадает в prime». Скалярное выражение над узлом `alias`: 1 — якоря есть и
- * все `lost`; 0 — есть хоть один не `lost`; NULL — якорей нет. То же соединение,
- * что у {@link anchorStatesSql}, и тот же ответ, что у {@link anchorWeightOf}:
- * лучший якорь решает, поэтому «лучший — lost» и «все — lost» одно и то же, и
- * prime прячет ровно то, что поиск помечает `lost` (hybrid.anchor.test.ts
- * сверяет это на всех сочетаниях состояний).
- *
- * Только знание: у самого узла-якоря (L1) дороги в дайджест prime (L2/L3) нет.
- * Цена — поиск по первичному ключу `edges (src, 'touches')` плюс по ключу
- * `anchors.node_id` на каждого якоря, ~1 мкс на строку, поэтому ставить его
- * туда, где он считается на каждой строке большого скана, нельзя — см.
- * prime_digest_scan (packages/cli/src/commands/prime.ts).
- */
-export function anchorsAllLostSql(alias: string): string {
-  return `(SELECT min(an.state = 'lost')
-              FROM edges t JOIN anchors an ON an.node_id = t.dst
-             WHERE t.src = ${alias}.id AND t.type = 'touches' AND t.deleted_at IS NULL)`;
-}
 
-/**
- * Предикат «знание НЕ из тех, чей код потерян целиком»: без якорей или с хоть
- * одним живым. `IS NOT 1`, а не `= 0`: у узла без якорей выражение — NULL, и
- * `= 0` отсекло бы почти всю базу.
- */
-export function anchorsAlivePredicate(alias: string): string {
-  return `(${anchorsAllLostSql(alias)} IS NOT 1)`;
-}
 
-/**
- * Узлы, у которых есть хоть один `lost` якорь, — подзапрос для `id IN (…)`.
- * Счётчик скрытого идёт ОТ ПОТЕРЯННЫХ ЯКОРЕЙ по ix_anchors_check (state,
- * checked_at), а не от всех L2/L3: цена — число lost-якорей (~2–4 мкс на
- * якорь), а не размер памяти. Замер на 100k узлов (5000 видимых L2/L3, 2850
- * якорей, 493 lost): от якорей — 2.1 мс, от всех видимых узлов — 5.6 мс (по
- * ~1 мкс на строку, ×2.65 дороже). Нет ни одного lost — один спуск по индексу.
- */
-export function lostAnchorOwnersSql(): string {
-  return `SELECT t.src FROM anchors an INDEXED BY ix_anchors_check
-              JOIN edges t INDEXED BY ix_edges_dst
-                ON t.dst = an.node_id AND t.type = 'touches' AND t.deleted_at IS NULL
-             WHERE an.state = 'lost'`;
-}
 
 export const hybridQueries = defineQueries({
   // Один оператор = один round-trip: лексический пул + ранг + BM25-скор

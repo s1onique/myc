@@ -7,7 +7,7 @@
  */
 
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { run, type RunResult } from "../index.ts";
@@ -241,6 +241,128 @@ describe("resolveMycBin — команда для .mcp.json", () => {
     // не поднимался, и агент молча оставался без инструментов myc.
     const r = resolveMycBin("/repo", NONE, () => false);
     expect(r.source).toBe("none");
+  });
+});
+
+/**
+ * myc-ncjz3ktdgvcd: `MYC_BIN=$PWD/dist/myc myc wire` переписал закоммиченный
+ * .mcp.json: было "./dist/myc", стало "/Users/<кто-то>/src/memory/dist/myc".
+ * Для машинного .claude/settings.json абсолютный путь уместен, а файл,
+ * лежащий в git, — нет: клон на другой машине получает путь, которого у неё
+ * нет. Проверка «отслеживается ли файл» — у самого git.
+ */
+describe("отслеживаемый git'ом .mcp.json и абсолютный MYC_BIN", () => {
+  const RELATIVE_MCP = `${JSON.stringify(
+    { mcpServers: { myc: { command: "./dist/myc", args: ["mcp", "--profile", "agent"] } } },
+    null,
+    2,
+  )}\n`;
+  /** Абсолютный путь бинаря ЭТОЙ машины — то, что человек передаёт в MYC_BIN. */
+  let absBin: string;
+
+  beforeEach(() => {
+    absBin = join(dir, "dist", "myc");
+  });
+
+  function git(...a: string[]): boolean {
+    return Bun.spawnSync(["git", ...a], { cwd: dir, stdout: "pipe", stderr: "pipe" }).success;
+  }
+
+  /** Кладёт rel в индекс git: с этого момента файл отслеживается. */
+  function trackFile(rel: string, content: string): void {
+    if (!git("init", "-q")) throw new Error("git unavailable in test environment");
+    write(rel, content);
+    if (!git("add", rel)) throw new Error("git add failed");
+  }
+
+  /** Пишет бинарь (exists() обязана его найти) и зовёт wire с абсолютным MYC_BIN. */
+  function absMyc(...args: string[]): Promise<RunResult> {
+    write("dist/myc", "#!/bin/sh\n");
+    const r = new Registry();
+    r.register(createPrimeCommand());
+    r.register(createAbsorbSessionCommand());
+    r.register(createWireCommand(r, { env: { MYC_BIN: absBin } }));
+    r.register(createUnwireCommand());
+    return run(["-C", dir, ...args], { registry: r, env: { MYC_ACTOR: "tester" } });
+  }
+
+  function warnCodes(r: RunResult): string[] {
+    return ((JSON.parse(r.stdout as string) as { warn: { code: string }[] }).warn ?? []).map((w) => w.code);
+  }
+
+  test("ОТСЛЕЖИВАЕМЫЙ .mcp.json с относительной командой абсолютная не переписывает", async () => {
+    trackFile(".mcp.json", RELATIVE_MCP);
+    expect((await absMyc("wire", "--agents", "claude")).code).toBe(0);
+    expect(read(".mcp.json")).toBe(RELATIVE_MCP);
+    // И повторный прогон тоже: «оставить как есть» — не разовая уступка.
+    expect((await absMyc("wire", "--agents", "claude")).code).toBe(0);
+    expect(read(".mcp.json")).toBe(RELATIVE_MCP);
+  });
+
+  test("…и в отчёте — WARN wire.absolute_path_tracked, человеку видно и без --json", async () => {
+    trackFile(".mcp.json", RELATIVE_MCP);
+    const r = await absMyc("wire", "--agents", "claude", "--json");
+    expect(r.code).toBe(0);
+    expect(warnCodes(r)).toContain("wire.absolute_path_tracked");
+    const env = JSON.parse(r.stdout as string) as { warn: { code: string; msg: string }[] };
+    const msg = env.warn.find((w) => w.code === "wire.absolute_path_tracked")?.msg ?? "";
+    // Человек узнаёт свою ситуацию: файл, который он коммитит, команда,
+    // которую у него оставили, и путь, который туда не попал.
+    expect(msg).toContain(".mcp.json");
+    expect(msg).toContain("./dist/myc");
+    expect(msg).toContain(absBin);
+    // Человеческий отчёт: строка WARN с тем же кодом.
+    const human = await absMyc("wire", "--agents", "claude");
+    expect(String(human.stdout)).toContain("WARN wire.absolute_path_tracked");
+  });
+
+  test("в отслеживаемом файле БЕЗ относительной команды абсолютный путь появляется — и назван", async () => {
+    trackFile(".mcp.json", '{}\n');
+    const r = await absMyc("wire", "--agents", "claude", "--json");
+    expect(r.code).toBe(0);
+    const mcp = JSON.parse(read(".mcp.json")) as { mcpServers: { myc: { command: string } } };
+    expect(mcp.mcpServers.myc.command).toBe(absBin);
+    expect(warnCodes(r)).toContain("wire.absolute_path_tracked");
+  });
+
+  test("нет git — файл неотслеживаемый, поведение прежнее: абсолютный путь пишется", async () => {
+    write(".mcp.json", RELATIVE_MCP);
+    const r = await absMyc("wire", "--agents", "claude", "--json");
+    expect(r.code).toBe(0);
+    const mcp = JSON.parse(read(".mcp.json")) as { mcpServers: { myc: { command: string } } };
+    expect(mcp.mcpServers.myc.command).toBe(absBin);
+    expect(warnCodes(r)).not.toContain("wire.absolute_path_tracked");
+  });
+
+  test(".claude/settings.json (неотслеживаемый) абсолютный путь по-прежнему получает", async () => {
+    // В одном прогоне: отслеживаемый .mcp.json держит относительную команду,
+    // а машинный settings.json принимает абсолютную, как и раньше.
+    trackFile(".mcp.json", RELATIVE_MCP);
+    write("dist/myc", "#!/bin/sh\n"); // exists() обязана найти MYC_BIN
+    const r = new Registry();
+    r.register(createPrimeCommand());
+    r.register(createAbsorbSessionCommand());
+    r.register(
+      createWireCommand(r, {
+        env: { MYC_BIN: absBin, CLAUDE_CONFIG_DIR: join(dir, "cfg") },
+        probeStatusLine: () => ({ ok: true }),
+      }),
+    );
+    r.register(createUnwireCommand());
+    const res = await run(["-C", dir, "wire", "--agents", "claude", "--status-line"], {
+      registry: r,
+      env: { MYC_ACTOR: "tester" },
+    });
+    expect(res.code).toBe(0);
+    const settings = JSON.parse(read(".claude/settings.json")) as { statusLine: { command: string } };
+    expect(settings.statusLine.command).toContain(absBin);
+    expect(read(".mcp.json")).toBe(RELATIVE_MCP);
+  });
+
+  test("то же правило для отслеживаемого .kimi-code/mcp.json", async () => {
+    trackFile(".kimi-code/mcp.json", RELATIVE_MCP);
+    expect((await absMyc("wire", "--agents", "kimi")).code).toBe(0);
+    expect(read(".kimi-code/mcp.json")).toBe(RELATIVE_MCP);
   });
 });
 
@@ -782,6 +904,171 @@ describe("kimi", () => {
 });
 
 /**
+ * MiMo Code (mimo, форк opencode). Что он читает — документация mimo,
+ * исходники XiaomiMiMo/MiMo-Code (тег v0.1.15) и живые прогоны
+ * `mimo debug skill` / `mimo debug config` в изолированном проекте;
+ * здесь закреплены ровно те факты, на которые опирается planMimo.
+ */
+describe("mimo", () => {
+  test("--agents mimo пишет только под .mimocode и не трогает чужого", async () => {
+    const r = await myc("wire", "--agents", "mimo");
+    expect(r.code).toBe(0);
+    expect(has(".mimocode/skills/myc/SKILL.md")).toBe(true);
+    expect(has(".mimocode/plugin/myc.ts")).toBe(true);
+    expect(has(".mimocode/mimocode.json")).toBe(true);
+    // Попросили одного mimo: ни чужих конфигов, ни общего .mcp.json.
+    expect(has(".claude/settings.json")).toBe(false);
+    expect(has(".mcp.json")).toBe(false);
+    expect(has("opencode.json")).toBe(false);
+    expect(has(".minimax/skills/myc/SKILL.md")).toBe(false);
+    expect(has("CLAUDE.md")).toBe(false);
+  });
+
+  test("MCP-запись в форме opencode, схема — только в созданном нами файле", async () => {
+    await myc("wire", "--agents", "mimo");
+    const cfg = JSON.parse(read(".mimocode/mimocode.json"));
+    expect(cfg["$schema"]).toBe("https://mimo.xiaomi.com/mimocode/config.json");
+    expect(cfg.mcp.myc).toEqual({
+      type: "local",
+      command: ["myc", "mcp", "--profile", "agent"],
+      enabled: true,
+    });
+  });
+
+  test("повторный wire не трогает чужой конфиг проекта, а наш — идемпотентен", async () => {
+    write(
+      ".mimocode/mimocode.json",
+      `${JSON.stringify({ $schema: "https://mimo.xiaomi.com/mimocode/config.json", share: "manual" }, null, 2)}\n`,
+    );
+    const before = read(".mimocode/mimocode.json");
+    const r = await myc("wire", "--agents", "mimo");
+    expect(r.code).toBe(0);
+    const once = read(".mimocode/mimocode.json");
+    expect(JSON.parse(once)).toMatchObject({ share: "manual", mcp: { myc: { type: "local" } } });
+    // Чужой узел сохранён, схема не подделана заново.
+    expect(JSON.parse(before)["mcp"]).toBeUndefined();
+    await myc("wire", "--agents", "mimo");
+    expect(read(".mimocode/mimocode.json")).toBe(once);
+  });
+
+  test("плагин — тело opencode с агентом mimo и своим заголовком", async () => {
+    await myc("wire", "--agents", "mimo");
+    const plugin = read(".mimocode/plugin/myc.ts");
+    expect(plugin).toContain("// .mimocode/plugin/myc.ts —");
+    expect(plugin).toContain('MYC_HOOK_AGENT: "mimo"');
+    // absorb-вызов в шаблоне построчный: "--agent" и имя — соседние строки.
+    expect(plugin).toMatch(/"--agent",\s+"mimo"/);
+    expect(plugin).toContain('"experimental.chat.system.transform"');
+    expect(plugin).toContain('"experimental.session.compacting"');
+    expect(plugin).toContain('"session.compacted"');
+    // Плагин не роняет сессию: весь его код — под try/catch (как у opencode).
+    expect(plugin).toContain("export const MycPlugin");
+  });
+
+  test("unwire снимает файлы и пустый .mimocode целиком", async () => {
+    await myc("wire", "--agents", "mimo");
+    expect(has(".mimocode/mimocode.json")).toBe(true);
+    expect((await myc("unwire")).code).toBe(0);
+    expect(has(".mimocode")).toBe(false);
+    expect(has(".mimocode/skills/myc/SKILL.md")).toBe(false);
+    expect(has(".mimocode/plugin/myc.ts")).toBe(false);
+  });
+});
+
+/**
+ * MiniMax Code (mcode). Факты — из бинаря @minimax-ai/code 0.6.2, его
+ * README/CHANGELOG и `mcode --help`; здесь закреплены ровно те из них, на
+ * которых стоит planMcode: свой скилл-каталог, общий .mcp.json и хуки,
+ * живущие только в пользовательских плагинах.
+ */
+describe("mcode", () => {
+  test("--agents mcode пишет только своё и берёт общий .mcp.json", async () => {
+    const r = await myc("wire", "--agents", "mcode");
+    expect(r.code).toBe(0);
+    expect(has(".minimax/skills/myc/SKILL.md")).toBe(true);
+    expect(has(".minimax/myc-hooks.mjs")).toBe(true);
+    // Единственная проектная дверь MCP у mcode — корневой .mcp.json.
+    expect(has(".mcp.json")).toBe(true);
+    // Чужого не тронули.
+    expect(has(".claude/settings.json")).toBe(false);
+    expect(has(".codex/config.toml")).toBe(false);
+    expect(has("opencode.json")).toBe(false);
+    expect(has(".mimocode")).toBe(false);
+    expect(has("CLAUDE.md")).toBe(false);
+  });
+
+  test("MCP-запись в форме, которую mcode разбирает (mcpServers + {command, args})", async () => {
+    await myc("wire", "--agents", "mcode");
+    const mcp = JSON.parse(read(".mcp.json"));
+    expect(typeof mcp.mcpServers.myc.command).toBe("string");
+    expect(mcp.mcpServers.myc.args).toEqual(["mcp", "--profile", "agent"]);
+  });
+
+  test("claude и mcode дают журналу одну запись на .mcp.json, а не две", async () => {
+    const r = await myc("wire", "--agents", "claude,mcode", "--json");
+    expect(r.code).toBe(0);
+    const data = JSON.parse(r.stdout as string).data as {
+      actions: { path: string }[];
+      journal?: { entries: { path: string }[] };
+    };
+    const planned = data.actions.filter((a) => a.path === ".mcp.json");
+    expect(planned.length).toBe(1);
+    const journal = readWireJournal(join(dir, ".myc", "wire.json"));
+    const recorded = (journal?.entries ?? []).filter((e) => e.path === ".mcp.json");
+    expect(recorded.length).toBe(1);
+    // И файл после прогона цел: оба харнесса видят один узел myc.
+    const mcp = JSON.parse(read(".mcp.json"));
+    expect(mcp.mcpServers.myc.args).toEqual(["mcp", "--profile", "agent"]);
+  });
+
+  test("helper оборачивает вывод старта в additionalContext, а сжатие не молчит вхолостую", async () => {
+    await myc("wire", "--agents", "mcode");
+    const helper = read(".minimax/myc-hooks.mjs");
+    expect(helper).toContain('MYC_HOOK_AGENT: "mcode"');
+    expect(helper).toContain('"--agent", "mcode"');
+    expect(helper).toContain('"--hook-output", "text"');
+    // Форма вывода SessionStart у mcode — CLAUDE (hookSpecificOutput).
+    expect(helper).toContain('hookEventName: "SessionStart"');
+    expect(helper).toContain("additionalContext: r.stdout");
+    // У PreCompact у mcode нет канала для контекста: вывод отбрасывается,
+    // и helper не может выйти кодом 2 (блокирует ход агента).
+    expect(helper).not.toContain("process.exit(2)");
+    expect(helper).toContain('EV === "session-start"');
+  });
+
+  test("про плагин в ~/.minimax/plugins сказано вслух — с файлами и секундами", async () => {
+    const r = await myc("wire", "--agents", "mcode", "--json");
+    expect(r.code).toBe(0);
+    const note = (JSON.parse(r.stdout as string).data as { notes: string[] }).notes.join("\n");
+    expect(note).toContain("~/.minimax/plugins/myc/.claude-plugin/plugin.json");
+    expect(note).toContain("~/.minimax/plugins/myc/hooks/hooks.json");
+    // Манифест обязателен: name — обязательное поле CLAUDE-формы.
+    expect(note).toContain('"name": "myc"');
+    expect(note).toContain('"SessionStart"');
+    expect(note).toContain('"PreCompact"');
+    expect(note).toContain("manual|auto");
+    // Таймаут у mcode в СЕКУНДАХ (как у Claude Code): 3 и 8, не 3000/8000.
+    expect(note).toContain('"timeout": 3');
+    expect(note).toContain('"timeout": 8');
+    expect(note).not.toContain('"timeout": 3000');
+    // Команда относительная и под защитой: плагин пользовательский,
+    // проект может быть без wire.
+    expect(note).toContain("if [ -f .minimax/myc-hooks.mjs ]");
+  });
+
+  test("unwire снимает свои файлы и пустый .minimax, чужой .mcp.json — по узлам", async () => {
+    write(".mcp.json", `${JSON.stringify({ mcpServers: { foreign: { command: "other" } } }, null, 2)}\n`);
+    await myc("wire", "--agents", "mcode");
+    expect(JSON.parse(read(".mcp.json")).mcpServers.foreign).toEqual({ command: "other" });
+    expect((await myc("unwire")).code).toBe(0);
+    // Чужой узел остался, наш снят, каталог опустел.
+    expect(JSON.parse(read(".mcp.json")).mcpServers).toEqual({ foreign: { command: "other" } });
+    expect(has(".minimax")).toBe(false);
+    expect(has(".minimax/myc-hooks.mjs")).toBe(false);
+  });
+});
+
+/**
  * Строка статуса Claude Code — опция `--status-line` (без флага statusLine не
  * трогается, решение задачи memory-fbzbw5pexjs7). Прежняя действующая строка
  * — проектная, иначе пользовательская — продолжает получать тот же ввод, а
@@ -923,6 +1210,16 @@ describe("строка статуса: --status-line", () => {
     expect(notes).toContain("Codex: status line not installed");
     expect(notes).toContain("opencode: status line not installed");
     expect(notes).toContain("Kimi: this version of wire does not install the status line");
+    expect(notes).toContain("only for Claude Code");
+    expect(has(".claude/settings.json")).toBe(false);
+  });
+
+  test("mcode, mimo: строку не ставим — и говорим это, а не молчим", async () => {
+    const r = await sl(slRegistry(), "wire", "--agents", "mcode,mimo", "--status-line", "--json");
+    expect(r.code).toBe(0);
+    const notes = (JSON.parse(r.stdout as string).data as { notes: string[] }).notes.join("\n");
+    expect(notes).toContain("mcode: status line not installed");
+    expect(notes).toContain("mimo: status line not installed");
     expect(notes).toContain("only for Claude Code");
     expect(has(".claude/settings.json")).toBe(false);
   });
@@ -1084,6 +1381,35 @@ describe("unwire удаляет файлы, которые создал wire", (
     expect(un.code).toBe(0);
     for (const p of CREATED) expect([p, has(p)]).toEqual([p, false]);
     expect(String((JSON.parse(un.stdout as string).data as { removed: string[] }).removed)).toContain("file created by wire — deleted");
+  });
+
+  test("и пустые каталоги: после unwire дерево такое же, каким было до wire", async () => {
+    // memory-v30bvbp54qvc: файлы удалялись, а `.claude/`, `.codex/`,
+    // `.kimi-code/`, `.opencode/` оставались пустыми — человек видит их в
+    // `git status` и не знает, откуда они. Справка при этом обещает
+    // «remove exactly what myc wire installed».
+    const before = readdirSync(dir).sort();
+    const r = new Registry();
+    r.register(createPrimeCommand());
+    r.register(createAbsorbSessionCommand());
+    r.register(createWireCommand(r, { probeStatusLine: () => ({ ok: true }), env: { CLAUDE_CONFIG_DIR: join(dir, "cfg") }, platform: "darwin" }));
+    r.register(createUnwireCommand());
+    const sl = (...args: string[]): Promise<RunResult> => run(["-C", dir, ...args], { registry: r, env: { MYC_ACTOR: "tester" } });
+    expect((await sl("wire", "--status-line", "--agents-md")).code).toBe(0);
+    expect((await sl("wire", "--agents", "opencode")).code).toBe(0);
+    expect(readdirSync(dir).sort()).not.toEqual(before);
+
+    expect((await sl("unwire")).code).toBe(0);
+    expect(readdirSync(dir).sort()).toEqual(before);
+  });
+
+  test("каталог с чужим содержимым остаётся: rmdir непустой не удаляет", async () => {
+    await myc("wire", "--agents", "claude");
+    write(".claude/чужое.txt", "не наше\n");
+    expect((await myc("unwire")).code).toBe(0);
+    // Каталог остался вместе с чужим файлом — и это не проверка «наше/не
+    // наше», а свойство rmdir: непустой он не трогает.
+    expect(has(".claude/чужое.txt")).toBe(true);
   });
 
   test("файл, бывший до wire, остаётся — даже пустым", async () => {

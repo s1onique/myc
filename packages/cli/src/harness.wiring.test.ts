@@ -127,16 +127,19 @@ function unitsOf(path: string): Unit[] {
  *   migrations/001, 003 — CHECK схемы; текст применённой миграции заморожен
  *     чек-суммой (swarm/src/schema.ts) и правке не подлежит вообще.
  *   migrations/008 — перестройка тех же таблиц под расширенный CHECK.
- *     Тоже замороженный DDL: следующий харнесс потребует миграции 9, а не
- *     правки восьмой. Что список в схеме совпадает с HARNESSES, доказывает
- *     не текст, а поведение — swarm/src/roster.test.ts, «CHECK схемы
- *     принимает ровно HARNESSES».
+ *     Тоже замороженный DDL: следующий харнесс требует НОВОЙ миграции
+ *     (009 занята, 010 — харненсы mcode/mimo), а не правки восьмой. Что
+ *     список в схеме совпадает с HARNESSES, доказывает не текст, а
+ *     поведение — swarm/src/roster.test.ts, «CHECK схемы принимает ровно
+ *     HARNESSES».
+ *   migrations/010 — та же перестройка под mcode и mimo, тоже замороженный.
  */
 const MAY_ENUMERATE: ReadonlyMap<string, string> = new Map([
   ["swarm/src/harness.ts", "источник истины"],
   ["swarm/src/migrations/001-swarm-model.ts", "замороженный DDL"],
   ["swarm/src/migrations/003-swarm-attempt.ts", "замороженный DDL"],
   ["swarm/src/migrations/008-harness-codex.ts", "замороженный DDL"],
+  ["swarm/src/migrations/010-harness-mcode-mimo.ts", "замороженный DDL"],
 ]);
 
 function enumerations(): Unit[] {

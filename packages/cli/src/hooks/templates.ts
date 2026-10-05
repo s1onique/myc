@@ -38,6 +38,18 @@ export interface HookSpec {
   readonly innerMs: number;
   /** Команда myc; хук не ставится, если её нет в реестре этой сборки. */
   readonly command: string;
+  /**
+   * Команды ЕЩЁ НЕТ, и вот задача, которая её заведёт.
+   *
+   * Имя команды здесь — такое же обещание пользователю, как в подсказке
+   * отказа, только через другую дверь: `myc wire` печатает его в WARN
+   * «команды `myc X` нет в этой сборке». Сторож советов эту дверь не видел
+   * (имя доезжает подстановкой, а не литералом), и опечатка в спеке жила бы
+   * молча (memory-gbp45ytdv6e6). Теперь он сверяет `command` с реестром, а
+   * это поле — единственный способ сказать «знаю, что нет, вот задача».
+   * Когда команда появится, сторож потребует убрать пометку.
+   */
+  readonly planned?: string;
   /** Выражение аргументов на JS — подставляется в helper как есть. */
   readonly argsExpr: string;
   /** Блокирует агента и обязан вернуть текст в контекст. */
@@ -86,6 +98,10 @@ export const HOOK_SPECS: readonly HookSpec[] = [
     timeoutMs: 2000,
     innerMs: 1500,
     command: "close-session",
+    // Команды в сборке нет: memory-2v4kzpg90a5b. `myc wire` говорит об этом
+    // вслух и хук не ставит — а сторож советов теперь знает, что это
+    // названное отсутствие, а не опечатка.
+    planned: "memory-2v4kzpg90a5b",
     argsExpr: `["close-session", "--transcript", payload.transcript_path ?? "-"]`,
     injectsContext: false,
   },
@@ -632,11 +648,11 @@ process.exit(0);
  * остаётся страховкой и пишет эпизод, если основной не отработал. Двойной
  * записи нет: страховка смотрит на отметку `handled`.
  */
-export function opencodePlugin(opts: HelperOptions): string {
+function opencodeFamilyPlugin(opts: HelperOptions, agent: string, relPath: string): string {
   const sessionStart = opts.events.includes("session-start");
   const preCompact = opts.events.includes("pre-compact");
   const postEdit = opts.events.includes("post-edit");
-  return `// .opencode/plugin/myc.ts — ${GENERATED}.
+  return `// ${relPath} — ${GENERATED}.
 //
 // Правило то же, что у helper'ов Claude Code, Codex и Kimi: myc НИКОГДА не
 // валит сессию агента. Любая ошибка, любой таймаут, отсутствие бинаря —
@@ -665,7 +681,7 @@ const run = async (args: string[], ms: number, ev: string, stdin?: string): Prom
       stdin: stdin === undefined ? "ignore" : new TextEncoder().encode(stdin),
       stdout: "pipe",
       stderr: "ignore",
-      env: { ...process.env, MYC_HOOK: ev, MYC_HOOK_AGENT: "opencode" },
+      env: { ...process.env, MYC_HOOK: ev, MYC_HOOK_AGENT: ${JSON.stringify(agent)} },
     });
     const timer = setTimeout(() => {
       try {
@@ -740,7 +756,7 @@ const absorb = async (client: any, sessionID: string): Promise<string> =>
       "--budget",
       "1200",
       "--agent",
-      "opencode",
+      ${JSON.stringify(agent)},
       "--session",
       sessionID,
       "--hook-output",
@@ -754,8 +770,15 @@ const absorb = async (client: any, sessionID: string): Promise<string> =>
 /** Сжатия, уже записанные основным хуком: страховка их не переписывает. */
 const handled = new Map<string, number>();
 const HANDLED_MS = 60000;
-/** Сессии, которым уже отдали prime: он стоит запроса, а не каждого запроса. */
-const primed = new Set<string>();
+/** Текст prime на сессию: считается один раз, кладётся в каждый запрос. */
+const primed = new Map<string, string>();
+/**
+ * Признак служебного запроса opencode. Отличить его больше нечем: на вход
+ * хука приходит только {sessionID, model}. Проверено на настоящем запуске
+ * opencode: у генератора заголовка первый системный промпт начинается с
+ * "You are a title generator" (memory-synef5yh4xf2).
+ */
+const SERVICE_PROMPT = /^\s*you are a (title|summary)/i;
 
 export const MycPlugin = async ({ client, directory }: { client: any; directory?: string }) => {
   if (typeof directory === "string" && directory.length > 0) DIR = directory;
@@ -788,8 +811,18 @@ export const MycPlugin = async ({ client, directory }: { client: any; directory?
     },
     /**
      * prime вместо несуществующего session.start. Системный промпт — тот
-     * единственный канал, который у плагина есть: событие создания сессии
-     * текст доставить некуда.  Один раз на сессию, не на каждый запрос.
+     * единственный канал, который у плагина есть.
+     *
+     * КЛАДЁТСЯ В КАЖДЫЙ ЗАПРОС, А НЕ ОДИН РАЗ НА СЕССИЮ (memory-synef5yh4xf2,
+     * замерено на настоящем запуске opencode 1.18.31 с записью тел запросов).
+     * opencode зовёт этот хук на КАЖДЫЙ запрос к модели и собирает системный
+     * промпт заново — в историю он не пишется. А первым запросом новой
+     * сессии идёт ГЕНЕРАТОР ЗАГОЛОВКА, с тем же sessionID: «один раз на
+     * сессию» уезжал именно туда, и оба шага основного агента приходили без
+     * prime. В TUI агент не видел его практически никогда.
+     *
+     * Текст считается один раз и кешируется на сессию (запускать myc prime
+     * на каждый запрос к модели нельзя), а кладётся всегда.
      */
     "experimental.chat.system.transform": async (
       input: { sessionID?: string },
@@ -798,9 +831,15 @@ export const MycPlugin = async ({ client, directory }: { client: any; directory?
       if (!${sessionStart ? "true" : "false"}) return;
       try {
         const id = input?.sessionID;
-        if (typeof id !== "string" || id.length === 0 || primed.has(id)) return;
-        primed.add(id);
-        const text = await run(["prime", "--budget", "2000", "--format", "agent", "--session", id], 2500, "session-start");
+        if (typeof id !== "string" || id.length === 0) return;
+        // Служебный вызов (генератор заголовка, сводка) — не агент: контекст
+        // ему не нужен, а прежняя логика уезжала ровно сюда.
+        if (SERVICE_PROMPT.test(output?.system?.[0] ?? "")) return;
+        let text = primed.get(id);
+        if (text === undefined) {
+          text = await run(["prime", "--budget", "2000", "--format", "agent", "--session", id], 2500, "session-start");
+          primed.set(id, text);
+        }
         if (text.trim().length > 0) output.system.push(text);
       } catch {}
     },
@@ -816,6 +855,40 @@ export const MycPlugin = async ({ client, directory }: { client: any; directory?
   };
 };
 `;
+}
+
+export function opencodePlugin(opts: HelperOptions): string {
+  return opencodeFamilyPlugin(opts, "opencode", ".opencode/plugin/myc.ts");
+}
+
+/**
+ * MiMo Code (`.mimocode/plugin/myc.ts`) — то же тело, что у opencode.
+ *
+ * mimo — ФОРК opencode, и здесь это не аналогия, а прочитанный факт
+ * (бинарь @mimo-ai/mimocode-darwin-arm64 0.1.15 плюс исходники
+ * XiaomiMiMo/MiMo-Code на теге v0.1.15):
+ *
+ * 1. ШИНА СОБЫТИЙ ОДНА В ОДИН: `experimental.chat.system.transform`,
+ *    `experimental.session.compacting`, `session.compacted`,
+ *    `tool.execute.after`, `client.session.messages` — всё, на что
+ *    опирается шаблон выше, в бинаре mimo есть; `appendContext`
+ *    отсутствует (0 вхождений), как и у opencode — дверь в контекст та же.
+ * 2. ПЛАГИН АВТОЗАГРУЖАЕТСЯ ИЗ `.mimocode/plugin/`: ConfigPlugin.load
+ *    гоняет `{plugin,plugins}/*.{ts,js}` по каталогам конфига, а
+ *    ConfigPaths.directories ведёт проектный `.mimocode` вверх от cwd до
+ *    worktree — отдельная запись в mimocode.json не нужна. Проверено
+ *    живым прогоном: `mimo debug config` в изолированном проекте показал
+ *    файл из `.mimocode/plugin/` в разрешённом списке `plugin[]`.
+ * 3. Скиллы проекта mimo читает из `.mimocode/skills/<имя>/SKILL.md`
+ *    (и `.mimocode/skill/`), фронтматтер name+description — общий с Claude
+ *    Code формат, конфиг
+ *    проекта — `.mimocode/mimocode.json`; это planMimo ставит рядом.
+ *
+ * Агент в атрибутах эпизода — `mimo` (MYC_HOOK_AGENT и `--agent`): имя
+ * попадает в ростер той же миграцией CHECK, что и mcode.
+ */
+export function mimoPlugin(opts: HelperOptions): string {
+  return opencodeFamilyPlugin(opts, "mimo", ".mimocode/plugin/myc.ts");
 }
 
 /**
@@ -902,16 +975,24 @@ export function opencodeUserPlugin(opts: OpencodeUserPluginOptions): string {
   }
   if (opts.events.includes("session-start")) {
     hooks.push(`    // prime in place of the session.start opencode does not have: the system
-    // prompt is the one channel a plugin has. Once per session.
+    // prompt is the one channel a plugin has. Added to EVERY request, not once
+    // per session: opencode rebuilds the system prompt for each model call and
+    // the first call of a new session is the title generator, which is where
+    // "once per session" used to go (memory-synef5yh4xf2). The text itself is
+    // computed once and cached.
     "experimental.chat.system.transform": async (
       input: { sessionID?: string },
       output: { system: string[] },
     ): Promise<void> => {
       try {
         const id = input?.sessionID;
-        if (typeof id !== "string" || id.length === 0 || primed.has(id)) return;
-        primed.add(id);
-        const text = await run(["prime", "--budget", "2000", "--format", "agent", "--session", id], 2500, "session-start");
+        if (typeof id !== "string" || id.length === 0) return;
+        if (SERVICE_PROMPT.test(output?.system?.[0] ?? "")) return;
+        let text = primed.get(id);
+        if (text === undefined) {
+          text = await run(["prime", "--budget", "2000", "--format", "agent", "--session", id], 2500, "session-start");
+          primed.set(id, text);
+        }
         if (text.trim().length > 0) output.system.push(text);
       } catch {}
     },`);
@@ -1005,7 +1086,15 @@ function bin(): string {
 const handled = new Map<string, number>();
 const HANDLED_MS = 60000;
 /** Sessions that already got prime: it costs a request, not every request. */
-const primed = new Set<string>();
+/** The prime text per session: computed once, added to every request. */
+const primed = new Map<string, string>();
+/**
+ * How a service request of opencode is told apart. There is nothing else to
+ * go by: the hook receives only {sessionID, model}. Measured on a real
+ * opencode run — the title generator's first system prompt starts with
+ * "You are a title generator" (memory-synef5yh4xf2).
+ */
+const SERVICE_PROMPT = /^\s*you are a (title|summary)/i;
 
 // One set of hooks per opencode instance. A server process may serve several
 // directories and imports this module once, so the project directory lives in
@@ -1267,6 +1356,169 @@ export function kimiHooksToml(events: readonly HookEvent[]): string {
   return lines.join("\n");
 }
 
+export const MCODE_HELPER_REL = ".minimax/myc-hooks.mjs";
+
+/**
+ * Что ставится mcode (`.minimax/myc-hooks.mjs` + плагин для человека).
+ *
+ * Всё ниже установлено ЧТЕНИЕМ бинаря @minimax-ai/code 0.6.2
+ * (`~/.minimax-code/releases/0.6.2/lib`, chunks) и его README/CHANGELOG, а
+ * не догадкой по имени харнесса:
+ *
+ * 1. ХУКИ У MCODE ЖИВУТ ТОЛЬКО В ПЛАГИНАХ. Регистр возможностей внутри
+ *    бинаря прямо говорит: standalone user hooks — `status: "retired"`,
+ *    «Custom hooks belong to Plugins». Проектных плагинов нет:
+ *    `scanLocalPackages()` сканирует ЕДИНСТВЕННЫЙ каталог
+ *    `join(dataDir, "plugins")` — это `~/.minimax/plugins`
+ *    (MINIMAX_DATA_DIR ?? ~/.minimax, symlink ~/.mavis). Поэтому, как у
+ *    Kimi, wire ставит исполняемую половину — helper в проекте — и печатает
+ *    готовые файлы плагина, которые человек один раз кладёт себе в
+ *    `~/.minimax/plugins/myc/`.
+ * 2. МАНИФЕСТ mcode читает трёх видов: свой `plugin.json`, а также
+ *    `.claude-plugin/plugin.json` и `.codex-plugin/plugin.json`. Берём
+ *    CLAUDE-формат: хуки лежат в `hooks/hooks.json` (defaultPath
+ *    загрузчика), форма записи — та же, что у настроек Claude Code.
+ * 3. СОБЫТИЯ ЕСТЬ: полный список событий бинаря (`npe`) содержит
+ *    SessionStart, SessionEnd, UserPromptSubmit, PreToolUse, PostToolUse,
+ *    Stop, SubagentStart, SubagentStop, PreCompact, PostCompact. Событий
+ *    ДВА — session-start и pre-compact — по той же причине, что у Codex и
+ *    Kimi: post-edit не ставится, пока форма tool_input mcode не подтверждена
+ *    чтением (хук, который не сработает, хуже отсутствующего).
+ * 4. ВЫХОД SessionStart: разрешённый набор ключей (функция BJe,
+ *    sourceFormat CLAUDE) включает `hookSpecificOutput`, а разбор
+ *    additionalContext отдельной функцией (LJe) совпадает с Claude Code —
+ *    поэтому вывод myc заворачивается в additionalContext, как у Codex.
+ * 5. ВЫХОД PreCompact: набор ключей — continue/stopReason/suppressOutput/
+ *    systemMessage/terminalSequence плюс decision/reason; канала для
+ *    контекста НЕТ, а неверный JSON уходит в разбор решений (перед
+ *    сжатием мcode проверяет decision.continue). Значит вывод absorb-session
+ *    на pre-compact helper молча отбрасывает: эпизод уже записан самим
+ *    absorb (побочный эффект), а спасательный пакет контекст не примет —
+ *    это свойство харнесса, а не упущение wire.
+ * 6. ВХОД: у CLAUDE-формата исполнитель требует transcriptPath на входе
+ *    (проверка в FSn: `sourceFormat==="CLAUDE" && transcriptPath==null`
+ *    валит запуск хука), а PreCompact обязан содержать `trigger` — поля
+ *    приходят в snake_case, как у Claude Code: session_id, transcript_path,
+ *    cwd, trigger. Аргументы ниже написаны под эту схему.
+ * 7. Таймаут в записи хука — секунды (как у Claude Code и Kimi).
+ */
+const MCODE_EVENTS: ReadonlyMap<HookEvent, ClaudeEvent> = new Map([
+  ["session-start", "SessionStart"],
+  ["pre-compact", "PreCompact"],
+]);
+
+/**
+ * Команда для печатаемого hooks/hooks.json: относительная (cwd хука —
+ * проект) и под защитой существования файла: плагин-то пользовательский,
+ * а проект может быть без wire — чужая сессия не должна спотыкаться.
+ */
+function mcodeHookCommand(event: HookEvent): string {
+  return (
+    `if [ -f ${MCODE_HELPER_REL} ]; then node ${MCODE_HELPER_REL} ${event}; ` +
+    "else cat >/dev/null 2>&1 || true; fi"
+  );
+}
+
+export function mcodeHelper(opts: HelperOptions): string {
+  const wanted = [...MCODE_EVENTS.keys()];
+  const specs = HOOK_SPECS.filter((s) => opts.events.includes(s.event) && wanted.includes(s.event));
+  const limits = specs.map((s) => `  "${s.event}": ${s.innerMs},`).join("\n");
+  const args = specs
+    .map((s) =>
+      s.event === "session-start"
+        ? `  "session-start": ["prime", "--budget", "2000", "--format", "agent", "--session", payload.session_id ?? ""],`
+        : `  "pre-compact": ["absorb-session", "--reason", payload.trigger ?? "auto", "--transcript", payload.transcript_path ?? "-", "--budget", payload.trigger === "manual" ? "2000" : "1200", "--agent", "mcode", "--session", payload.session_id ?? "", "--hook-output", "text"],`,
+    )
+    .join("\n");
+  return `#!/usr/bin/env node
+// ${MCODE_HELPER_REL} — ${GENERATED}.
+//
+// Правило то же, что у helper'ов Claude Code, Codex и Kimi: myc НИКОГДА не
+// валит сессию агента. Любая ошибка, любой таймаут, отсутствие бинаря —
+// выход 0 и пустой stdout. Кодом 2 mcode блокирует ход, поэтому им мы не
+// выходим никогда.
+import { spawnSync } from "node:child_process";
+import { existsSync, readFileSync } from "node:fs";
+import { join } from "node:path";
+
+const EV = process.argv[2];
+
+let payload = {};
+try {
+  payload = JSON.parse(readFileSync(0, "utf8") || "{}");
+} catch {}
+
+// mcode кладёт cwd проекта в payload (runEvent передаёт его отдельным
+// полем); нет его — работаем из текущего каталога.
+const DIR = typeof payload.cwd === "string" && payload.cwd ? payload.cwd : process.cwd();
+
+const LIMIT = {
+${limits}
+}[EV] ?? 2000;
+
+${BIN_LOOKUP}
+
+const ARGS = {
+${args
+  .split("\n")
+  .map((l) => `  ${l.trim()}`)
+  .join("\n")}
+}[EV];
+
+if (!ARGS) process.exit(0);
+
+try {
+  const r = spawnSync(bin(), ARGS, {
+    cwd: DIR,
+    timeout: LIMIT,
+    encoding: "utf8",
+    maxBuffer: 8 * 1024 * 1024,
+    env: { ...process.env, MYC_HOOK: EV, MYC_HOOK_AGENT: "mcode" },
+  });
+  // SessionStart: контекст у mcode только через hookSpecificOutput
+  // (набор ключей CLAUDE-формата), обычный текст он не подмешивает.
+  if (EV === "session-start" && r.status === 0 && r.stdout && r.stdout.trim()) {
+    process.stdout.write(
+      JSON.stringify({
+        hookSpecificOutput: { hookEventName: "SessionStart", additionalContext: r.stdout },
+      }) + "\\n",
+    );
+  }
+  // pre-compact: stdout НЕ печатаем — у PreCompact у mcode нет канала для
+  // контекста, а неразобранный JSON идёт в разбор решений перед сжатием.
+} catch {}
+
+process.exit(0);
+`;
+}
+
+/**
+ * Два файла, которые печатает planMcode для ручной установки плагина в
+ * `~/.minimax/plugins/myc/`. Форма — CLAUDE-совместимая (см. докстроку
+ * MCODE_EVENTS): манифест с обязательным name, хуки — в hooks/hooks.json,
+ * который загрузчик берёт по умолчанию, если манифест не указал путь.
+ */
+export function mcodePluginFiles(opts: HelperOptions): { manifest: string; hooks: string } {
+  const byEvent: Record<string, unknown[]> = {};
+  for (const spec of HOOK_SPECS) {
+    if (!opts.events.includes(spec.event) || !MCODE_EVENTS.has(spec.event)) continue;
+    const claudeEvent = MCODE_EVENTS.get(spec.event)!;
+    const timeout = Math.max(1, Math.ceil(spec.timeoutMs / 1000));
+    const entry: Record<string, unknown> = {
+      hooks: [{ type: "command", command: mcodeHookCommand(spec.event), timeout }],
+    };
+    if (spec.matcher !== undefined) entry["matcher"] = spec.matcher;
+    byEvent[claudeEvent] = [entry];
+  }
+  const manifest = JSON.stringify(
+    { name: "myc", version: "1", description: "MiniMax Code hooks for the myc workspace" },
+    null,
+    2,
+  );
+  const hooks = JSON.stringify({ hooks: byEvent }, null, 2);
+  return { manifest, hooks };
+}
+
 /** Вся инструкция агенту живёт в скилле, а не в CLAUDE.md (D10). */
 export function skillMd(): string {
   return `---
@@ -1292,7 +1544,7 @@ One graph: tasks with dependencies, project memory, links to code.
 
 ## Rules
 
-- One fact = one \`remember\`. Don't write paragraphs.
+- One fact = one \`remember\`: the claim and its reason.
 - Don't record code or secrets — record findings.
 - A contradiction does not overwrite the old note: \`myc link A supersedes B --reason "..."\`.
 - A \`WARN degraded.*\` line in a response means part of the index is not working

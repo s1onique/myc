@@ -30,6 +30,8 @@ import {
   HOOK_EVENTS,
   HOOK_SPECS,
   kimiHelper,
+  mcodeHelper,
+  mimoPlugin,
   opencodePlugin,
   type HookEvent,
 } from "./templates.ts";
@@ -112,6 +114,8 @@ describe("шаблоны объявляют вызывающего", () => {
     ["codex", codexHelper({ events, hookOutput: "json" }), "codex"],
     ["kimi", kimiHelper({ events, hookOutput: "text" }), "kimi"],
     ["opencode", opencodePlugin({ events, hookOutput: "text" }), "opencode"],
+    ["mcode", mcodeHelper({ events, hookOutput: "text" }), "mcode"],
+    ["mimo", mimoPlugin({ events, hookOutput: "text" }), "mimo"],
   ];
 
   for (const [harness, text, agent] of files) {

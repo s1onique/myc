@@ -65,6 +65,10 @@ import {
   HOOK_SPECS,
   kimiHelper,
   kimiHooksToml,
+  MCODE_HELPER_REL,
+  mcodeHelper,
+  mcodePluginFiles,
+  mimoPlugin,
   opencodePlugin,
   opencodeUserPlugin,
   skillMd,
@@ -116,6 +120,10 @@ export const ASK_SUBCOMMANDS: ReadonlyMap<string, string> = new Map([
   ["statusline", "--then executes a shell command"],
   ["wire", "rewrites the agent's own hooks and permissions"],
   ["unwire", "rewrites the agent's own hooks and permissions"],
+  // Сервер команды: открывает порт наружу, заводит арендаторов и ВЫДАЁТ
+  // токены доступа. Это работа человека у пульта, и вопрос здесь — не
+  // формальность: в нём видно, какой токен и кому собираются выдать.
+  ["serve", "opens a port, registers tenants and mints access tokens"],
 ]);
 
 /** `Bash(myc <команда>:*)` на каждую команду реестра, кроме ASK_SUBCOMMANDS, по алфавиту. */
@@ -138,6 +146,8 @@ const TOML_MCP_START = "# myc:mcp:start";
 const TOML_MCP_END = "# myc:mcp:end";
 /** Схему пишем только в созданный нами opencode.json — и снимаем вместе с ним. */
 const OPENCODE_SCHEMA = "https://opencode.ai/config.json";
+/** То же для .mimocode/mimocode.json (mimo читает его как проектный конфиг). */
+const MIMOCODE_SCHEMA = "https://mimo.xiaomi.com/mimocode/config.json";
 
 /**
  * Кого обслуживаем — ОДИН список на весь myc (@myc/swarm, harness.ts).
@@ -196,18 +206,37 @@ interface Evicted {
   readonly command: string;
 }
 
+/**
+ * Абсолютный путь бинаря, который добрался до отслеживаемого git'ом
+ * JSON-конфига MCP (myc-ncjz3ktdgvcd). Сам по себе выбор человека законен,
+ * но в закоммиченном файле текст пути остаётся в git: клон на другой машине
+ * получает путь, которого у неё нет. О каждом таком совпадении wire говорит
+ * вслух — кодом `wire.absolute_path_tracked` в выводе отчёта.
+ */
+interface TrackedAbsolute {
+  readonly path: string;
+  /** Абсолютная команда из MYC_BIN. */
+  readonly bin: string;
+  /** Относительная команда, уже стоявшая в файле (kept=true — она осталась). */
+  readonly command: string;
+  /** true — относительную команду оставили, абсолютную НЕ писали. */
+  readonly kept: boolean;
+}
+
 interface Plan {
   readonly actions: Action[];
   readonly conflicts: Conflict[];
   readonly evicted: Evicted[];
   readonly untouched: string[];
   readonly notes: string[];
+  /** Предупреждения плана: дойдут до человека через ctx.warn после планирования. */
+  readonly trackedAbsolute: TrackedAbsolute[];
   /** Наша строка статуса и то, что она заменила, — для журнала и unwire. */
   statusLine?: StatusLineRecord;
 }
 
 function emptyPlan(): Plan {
-  return { actions: [], conflicts: [], evicted: [], untouched: [], notes: [] };
+  return { actions: [], conflicts: [], evicted: [], untouched: [], notes: [], trackedAbsolute: [] };
 }
 
 /**
@@ -298,6 +327,17 @@ function asRecord(value: unknown): Record<string, unknown> {
   return value !== null && typeof value === "object" && !Array.isArray(value)
     ? { ...(value as Record<string, unknown>) }
     : {};
+}
+
+/**
+ * Узел не изменится этим прогоном: то, что собираемся записать, уже стоит.
+ * Сравнение в JSON — как файл и запишется, поэтому и раскладка ключей чужой
+ * записи, требующая перезаписи, считается изменением. Единственная копия
+ * этого правила: на ней стоит и detail слияния, и список узлов пользовательского
+ * слоя (memory-h744mh3f5ddy).
+ */
+function jsonSame(a: unknown, b: unknown): boolean {
+  return JSON.stringify(a) === JSON.stringify(b);
 }
 
 /**
@@ -400,6 +440,13 @@ function codexHookEntry(spec: HookSpec): Record<string, unknown> {
 
 interface SettingsPlan {
   readonly nodes: string[];
+  /**
+   * Узлы, которые ЭТОТ прогон реально изменит (добавит или перезапишет);
+   * их читает человек в detail. `nodes` шире — туда планировщик кладёт руку
+   * всегда, и по нему живут журнал, unwire и generatedFiles. Нет поля —
+   * меняются все перечисленные узлы (планировщики с одним узлом).
+   */
+  readonly changedNodes?: readonly string[];
   readonly conflicts: Conflict[];
   /** Что убрал `replace`; у планировщиков без хуков — пусто. */
   readonly evicted?: readonly Evicted[];
@@ -432,6 +479,7 @@ function mergeHookNodes(
   const value: Record<string, unknown> = { ...source.value };
   const hooks = asRecord(value["hooks"]);
   const nodes: string[] = [];
+  const changedNodes: string[] = [];
   const conflicts: Conflict[] = [];
   const evicted: Evicted[] = [];
   const notes: string[] = [];
@@ -471,13 +519,18 @@ function mergeHookNodes(
     }
 
     const kept = mode === "replace" ? [] : foreign;
-    hooks[event] = [...kept, ours];
+    const next = [...kept, ours];
+    hooks[event] = next;
     nodes.push(node);
+    // Уже записано ровно то, что планировщик положил бы, — узел не меняется,
+    // и человек в detail его не видит: «+N nodes» отвечает на вопрос «что
+    // изменится», а не «куда myc кладёт руку» (memory-h744mh3f5ddy).
+    if (!jsonSame(existing, next)) changedNodes.push(node);
   }
 
-  if (conflicts.length > 0) return { nodes, conflicts, evicted, notes, value };
+  if (conflicts.length > 0) return { nodes, changedNodes, conflicts, evicted, notes, value };
   if (nodes.length > 0) value["hooks"] = hooks;
-  return { nodes, conflicts, evicted, notes, value };
+  return { nodes, changedNodes, conflicts, evicted, notes, value };
 }
 
 /** Что `.claude/settings.json` получает в `permissions.allow` (см. LEGACY_PERMISSION). */
@@ -507,6 +560,7 @@ function mergeClaudeSettings(
   if (base.conflicts.length > 0) return base;
   const value = { ...base.value };
   const nodes = [...base.nodes];
+  const changedNodes = [...(base.changedNodes ?? [])];
   const notes = [...(base.notes ?? [])];
 
   const permissions = asRecord(value["permissions"]);
@@ -533,10 +587,12 @@ function mergeClaudeSettings(
     value["permissions"] = permissions;
   }
   if (added.length > 0) {
-    nodes.push(`permissions.allow[${added.length === 1 ? added[0] : `Bash(myc <command>:*) ×${added.length}`}]`);
+    const name = `permissions.allow[${added.length === 1 ? added[0] : `Bash(myc <command>:*) ×${added.length}`}]`;
+    nodes.push(name);
+    changedNodes.push(name);
   }
 
-  return { ...base, nodes, notes, value };
+  return { ...base, nodes, changedNodes, notes, value };
 }
 
 /** `.codex/hooks.json`: только узлы `hooks.<Event>`, без permissions. */
@@ -584,10 +640,13 @@ function planJsonMerge(
     plan.actions.push({ path: rel, kind: "unchanged", detail: "up to date", content, nodes: merged.nodes, backup: false, preexisting });
     return;
   }
+  // Человеку называются только те узлы, которые прогон меняет; журнал несёт
+  // весь nodes — по нему живут unwire и generatedFiles.
+  const changed = merged.changedNodes ?? merged.nodes;
   plan.actions.push({
     path: rel,
     kind: source.exists ? "merge" : "new",
-    detail: merged.nodes.length > 0 ? `+${countNodes(merged.nodes.length)}: ${merged.nodes.join(", ")}` : "no node changes",
+    detail: changed.length > 0 ? `+${countNodes(changed.length)}: ${changed.join(", ")}` : "no node changes",
     content,
     nodes: merged.nodes,
     backup: source.exists,
@@ -752,6 +811,80 @@ export function resolveMycBin(
   return { command: "myc", source: "none" };
 }
 
+/**
+ * Отслеживает ли git этот файл проекта. Спрос у самого git
+ * (`ls-files --error-unmatch`), а не чтение .gitignore: игноры вложенные,
+ * а индекс — истина в последней инстанции. Нет git (не установлен или
+ * каталог не репозиторий) — файл считается неотслеживаемым и wire ведёт
+ * себя как раньше: отсутствие git не повод ломать установку.
+ */
+function trackedByGit(root: string, rel: string): boolean {
+  try {
+    return (
+      Bun.spawnSync(["git", "ls-files", "--error-unmatch", rel], {
+        cwd: root,
+        stdin: "ignore",
+        stdout: "ignore",
+        stderr: "ignore",
+      }).exitCode === 0
+    );
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Что писать в `mcpServers.myc` JSON-конфига MCP (myc-ncjz3ktdgvcd).
+ *
+ * MYC_BIN — явный выбор человека и почти всегда абсолютный путь ЭТОЙ машины.
+ * Для машинных файлов (`.claude/settings.json`) это уместно, но
+ * `.mcp.json` лежит в git, и клон на другой машине получит чужой путь.
+ * Поэтому для отслеживаемого файла два правила:
+ *
+ * 1. в нём уже стоит относительная команда myc — она ОСТАЁТСЯ, абсолютная
+ *    её не заменяет (файл остаётся переносимым, прогон — без записи);
+ * 2. абсолютный путь всё же попадает в файл (наш узел там впервые или
+ *    там уже чужой абсолютный путь) — wire говорит об этом вслух кодом
+ *    `wire.absolute_path_tracked`: человек узнаёт, что собирается
+ *    закоммитить путь своей машины.
+ *
+ * Git спрашивают только когда ответ может что-то изменить: относительная
+ * команда переносима в любом файле, и лишний запуск git ни к чему.
+ */
+function planMcpServer(plan: Plan, o: WireOptions, rel: string, existing: unknown): Record<string, unknown> {
+  const fresh = { command: o.mycBin.command, args: ["mcp", "--profile", "agent"] };
+  if (!isAbsolute(o.mycBin.command)) return fresh;
+  if (!trackedByGit(o.root, rel)) return fresh;
+  const current = asRecord(existing)["command"];
+  if (typeof current === "string" && current.length > 0 && !isAbsolute(current)) {
+    plan.trackedAbsolute.push({ path: rel, bin: o.mycBin.command, command: current, kept: true });
+    // «Оставить как есть»: вся запись целиком, с чужими полями вроде env.
+    return asRecord(existing);
+  }
+  plan.trackedAbsolute.push({ path: rel, bin: o.mycBin.command, command: "(no relative command in the file)", kept: false });
+  return fresh;
+}
+
+/**
+ * Корневой `.mcp.json` — общий файл проектного MCP: его читают Claude Code,
+ * Kimi и mcode (README mcode: «Runtime автоматически загружает .mcp.json из
+ * основного рабочего каталога сессии»). Форма у всех одна и та же —
+ * `mcpServers.myc`, узел один, поэтому харнессов, ставящих его, за прогон
+ * может быть несколько, а планировать файл положено ровно один раз: два
+ * действия на один путь дали бы две одинаковые записи в журнале, и
+ * `unwire` снимал бы узел дважды.
+ */
+function planRootMcp(plan: Plan, o: WireOptions): void {
+  if (plan.actions.some((a) => a.path === ".mcp.json")) return;
+  planJsonMerge(plan, o.root, ".mcp.json", (source) => {
+    const value = { ...source.value };
+    const servers = asRecord(value["mcpServers"]);
+    servers["myc"] = planMcpServer(plan, o, ".mcp.json", servers["myc"]);
+    value["mcpServers"] = servers;
+    return { nodes: ["mcpServers.myc"], conflicts: [], value };
+  });
+}
+
 function planClaude(plan: Plan, o: WireOptions): void {
   const specs = HOOK_SPECS.filter((s) => o.events.includes(s.event));
   const settings = ".claude/settings.json";
@@ -778,13 +911,7 @@ function planClaude(plan: Plan, o: WireOptions): void {
         "every project; with --queue-hook the hook asks instead, otherwise remove it by hand (wire does not write there)",
     );
   }
-  planJsonMerge(plan, o.root, ".mcp.json", (source) => {
-    const value = { ...source.value };
-    const servers = asRecord(value["mcpServers"]);
-    servers["myc"] = { command: o.mycBin.command, args: ["mcp", "--profile", "agent"] };
-    value["mcpServers"] = servers;
-    return { nodes: ["mcpServers.myc"], conflicts: [], value };
-  });
+  planRootMcp(plan, o);
   plan.untouched.push("CLAUDE.md");
   if (o.statusLine) {
     plan.untouched.push(".claude/settings.local.json", "~/.claude/settings.json (read only)");
@@ -952,7 +1079,16 @@ function withStatusLine(base: SettingsPlan, o: WireOptions, rel: string): Settin
         "so Claude Code will show that line, not myc's (file left alone)",
     );
   }
-  return { ...base, value, nodes: [...base.nodes, "statusLine"], notes, statusLine: { path: rel, previous, passthrough } };
+  return {
+    ...base,
+    value,
+    nodes: [...base.nodes, "statusLine"],
+    // Строку, совпадающую с той, что myc написал бы, прогон не меняет —
+    // и в detail она не попадает.
+    changedNodes: [...(base.changedNodes ?? []), ...(jsonSame(current, next) ? [] : ["statusLine"])],
+    notes,
+    statusLine: { path: rel, previous, passthrough },
+  };
 }
 
 /**
@@ -1093,7 +1229,7 @@ function planKimi(plan: Plan, o: WireOptions): void {
   planJsonMerge(plan, o.root, ".kimi-code/mcp.json", (source) => {
     const value = { ...source.value };
     const servers = asRecord(value["mcpServers"]);
-    servers["myc"] = { command: o.mycBin.command, args: ["mcp", "--profile", "agent"] };
+    servers["myc"] = planMcpServer(plan, o, ".kimi-code/mcp.json", servers["myc"]);
     value["mcpServers"] = servers;
     return { nodes: ["mcpServers.myc"], conflicts: [], value };
   });
@@ -1113,6 +1249,95 @@ function planKimi(plan: Plan, o: WireOptions): void {
 }
 
 /**
+ * MiMo Code (`mimo`, @mimo-ai/cli — форк opencode). Что он читает —
+ * установлено документацией mimo.xiaomi.com/mimocode (skills, config-files,
+ * config-overrides), исходниками XiaomiMiMo/MiMo-Code на теге v0.1.15 и
+ * живыми прогонами бинаря 0.1.15 (`mimo debug skill`, `mimo debug config`
+ * в изолированном проекте), а не догадкой:
+ *
+ *   - Скиллы проекта: `.mimocode/skills/<имя>/SKILL.md` (и `.mimocode/skill/`),
+ *     фронтматтер name+description — общий формат, skillMd() подходит как
+ *     есть. Проверено прогоном debug skill: файл в `.mimocode/skills/`
+ *     попал в выдачу. Внешние брендовые каталоги (.claude/.codex/.opencode)
+ *     у mimo ВЫКЛЮЧЕНЫ по умолчанию (MIMOCODE_ENABLE_*_SKILLS), поэтому
+ *     скилл кладём только в СВОЙ каталог.
+ *   - Конфиг проекта: `.mimocode/mimocode.json` — именно так проектный
+ *     конфиг называет встроенная скилл-документация mimo; маркер в этом
+ *     файле появился в `mimo debug config`, вытеснив корневой mimocode.json.
+ *   - MCP: ключ `mcp` в формате opencode — {type:"local", command:[...],
+ *     enabled} (документация MCP); `$schema» пишем только в созданный нами
+ *     файл.
+ *   - Хуки: плагин `.mimocode/plugin/myc.ts`, автозагрузка каталога
+ *     подтверждена прогоном (файл из `.mimocode/plugin/` оказался в
+ *     resolved plugin[]); события те же, что у opencode — см. докстроку
+ *     mimoPlugin в templates.ts.
+ */
+function planMimo(plan: Plan, o: WireOptions): void {
+  if (o.statusLine) {
+    plan.notes.push(
+      "mimo: status line not installed — there is no config key for it, the TUI draws its own line",
+    );
+  }
+  planOwnFile(plan, o.root, ".mimocode/skills/myc/SKILL.md", skillMd());
+  planOwnFile(
+    plan,
+    o.root,
+    ".mimocode/plugin/myc.ts",
+    mimoPlugin({ events: o.events, hookOutput: o.hookOutput }),
+  );
+  planJsonMerge(plan, o.root, ".mimocode/mimocode.json", (source) => {
+    const value = { ...source.value };
+    if (!source.exists) value["$schema"] = MIMOCODE_SCHEMA;
+    const mcp = asRecord(value["mcp"]);
+    mcp["myc"] = { type: "local", command: ["myc", "mcp", "--profile", "agent"], enabled: true };
+    value["mcp"] = mcp;
+    return { nodes: ["mcp.myc"], conflicts: [], value };
+  });
+}
+
+/**
+ * MiniMax Code (`mcode`, @minimax-ai/code). Факты — из бинаря 0.6.2
+ * (`~/.minimax-code/releases/0.6.2/lib`), README/CHANGELOG пакета и
+ * `mcode --help`, а не по имени харнесса:
+ *
+ *   - Скиллы проекта: `walkUp` от каталога сессии ищет `.minimax/skills`
+ *     (приоритет 65), `.claude/skills` (60) и `.agents/skills`; внешние
+ *     источники включены по умолчанию (`external.enabled: true, walkUp:
+ *     true` в дефолтах конфига). СВОЙ каталог — `.minimax/skills`, чужие
+ *     (.claude) не занимаем.
+ *   - MCP: корень сессии, файл `.mcp.json` — единственная проектная дверь
+ *     (CHANGELOAD: «Automatically load project MCP servers from .mcp.json»).
+ *     Форма — `mcpServers` c {command, args}: разборчик принимает и обёртку,
+ *     и голую карту, верхние ключи — $schema/mcpServers. Это тот же файл,
+ *     что у Claude Code, — общий узел planRootMcp, а не вторая копия.
+ *   - Хуки: ТОЛЬКО пользовательские плагины (standalone hooks retired),
+ *     проектных плагинов mcode не читает. Поэтому, как у Kimi, wire ставит
+ *     helper (`.minimax/myc-hooks.mjs`) и печатает готовые файлы плагина
+ *     для `~/.minimax/plugins/myc/` — каталог сканируется при старте
+ *     (scanLocalPackages), отдельная команда установки не нужна.
+ *   - Статус-строки нет — замечаем, а не ставим молча.
+ */
+function planMcode(plan: Plan, o: WireOptions): void {
+  planOwnFile(plan, o.root, ".minimax/skills/myc/SKILL.md", skillMd());
+  planOwnFile(plan, o.root, MCODE_HELPER_REL, mcodeHelper({ events: o.events, hookOutput: o.hookOutput }));
+  planRootMcp(plan, o);
+  if (o.statusLine) {
+    plan.notes.push(
+      "mcode: status line not installed — this version of wire knows no mcode config key for it",
+    );
+  }
+  const files = mcodePluginFiles({ events: o.events, hookOutput: o.hookOutput });
+  plan.notes.push(
+    "mcode reads hooks only from user-level plugins (~/.minimax/plugins — MINIMAX_DATA_DIR ?? " +
+      "~/.minimax); wire does not write outside the project. The skill, MCP and the helper are in " +
+      "place; to also get prime at startup and an episode before compaction, create these two " +
+      "files once:\n" +
+      `  ~/.minimax/plugins/myc/.claude-plugin/plugin.json\n${files.manifest}\n\n` +
+      `  ~/.minimax/plugins/myc/hooks/hooks.json\n${files.hooks}`,
+  );
+}
+
+/**
  * Кто чем настраивается. Ключи — ВЕСЬ список харнессов и ровно он: тип
  * Record<Harness, …> не даст ни забыть нового, ни оставить выдуманного.
  */
@@ -1121,6 +1346,8 @@ const PLANNERS: Record<Harness, (plan: Plan, o: WireOptions) => void> = {
   codex: planCodex,
   opencode: planOpencode,
   kimi: planKimi,
+  mcode: planMcode,
+  mimo: planMimo,
 };
 
 function planAgentsMd(plan: Plan, o: WireOptions): void {
@@ -1413,6 +1640,13 @@ export const probeStatusLineBin: StatusLineProbe = (root, bin) => {
  * сам; затем сборки в проекте и ~/.myc/bin. Путь в проекте пишется
  * относительным (helper достраивает его от CLAUDE_PROJECT_DIR): settings.json
  * общий для команды, домашнему пути одного разработчика там не место.
+ *
+ * Пользовательский ярус (`--scope user`) получает АБСОЛЮТНЫЙ путь всегда,
+ * и по той же причине, что resolveUserMycBin: settings.json там личный,
+ * проектного правила `Bash(myc:*)` над ним нет, а сессии, поднятые не из
+ * терминала человека, видят другой PATH — слово `myc` в них кончается
+ * «command not found», и хук молча перестаёт оборачивать тяжёлые команды.
+ * Правило выбора бинаря одно — здесь; ярус меняет только форму команды.
  */
 export interface QueueBinChoice {
   /** Что получит хук: `myc` (ищется в PATH), путь от корня проекта или абсолютный. */
@@ -1423,9 +1657,11 @@ export interface QueueBinChoice {
 export type QueueProbe = (
   root: string,
   env: NodeJS.ProcessEnv,
+  /** Ярус: пользовательский получает абсолютный путь даже для кандидата из PATH. */
+  scope?: "project" | "user",
 ) => { readonly ok: true; readonly bin: QueueBinChoice } | { readonly ok: false; readonly why: string };
 
-export const probeQueueBin: QueueProbe = (root, env) => {
+export const probeQueueBin: QueueProbe = (root, env, scope = "project") => {
   const candidates: { command: string; exe: string; source: QueueBinChoice["source"] }[] = [];
   const own = env.MYC_BIN;
   if (own !== undefined && own.length > 0) candidates.push({ command: resolve(root, own), exe: resolve(root, own), source: "env" });
@@ -1450,7 +1686,11 @@ export const probeQueueBin: QueueProbe = (root, env) => {
     }
     try {
       const r = Bun.spawnSync([c.exe, "run", "--help"], { cwd: root, env, stdin: "ignore", stdout: "pipe", stderr: "pipe", timeout: 10_000 });
-      if (r.exitCode === 0 && r.stdout.toString().includes("myc run")) return { ok: true, bin: { command: c.command, source: c.source } };
+      // Единственное место, где решается форма команды: проектный ярус берёт
+      // слово/относительный путь (c.command), пользовательский — абсолютный
+      // путь (c.exe вычислен здесь же, для кандидата из PATH это join(dir, "myc")).
+      if (r.exitCode === 0 && r.stdout.toString().includes("myc run"))
+        return { ok: true, bin: { command: scope === "user" ? c.exe : c.command, source: c.source } };
       const err = r.stderr.toString().trim().split("\n")[0] ?? "";
       tried.push(`${c.command} run --help: exit ${r.exitCode}${err.length > 0 ? ` (${err})` : ""}`);
     } catch (e) {
@@ -1541,7 +1781,8 @@ export function createWireCommand(registry: Registry, overrides: Partial<WireDep
   };
   return {
     name: "wire",
-    summary: "install myc hooks and MCP for Claude Code, Codex, opencode and Kimi without touching foreign files",
+    summary:
+      "install myc hooks and MCP for Claude Code, Codex, opencode, Kimi, MiniMax Code and MiMo Code without touching foreign files",
     flags: WIRE_FLAGS,
     help:
       "Writes only its own files in full (helper, skill, plugin); JSON configs are merged node by " +
@@ -1599,7 +1840,7 @@ export function createWireCommand(registry: Registry, overrides: Partial<WireDep
         );
       }
 
-      const mycBin = resolveMycBin(root);
+      const mycBin = resolveMycBin(root, deps.env);
       const statusLine = ctx.flags["status-line"] === true;
 
       // Хук очереди — только Claude Code и только на myc, который знает `run`
@@ -1692,6 +1933,20 @@ export function createWireCommand(registry: Registry, overrides: Partial<WireDep
           ].join("\n"),
           ExitCode.CONFLICT,
           "myc wire --hook-mode append",
+        );
+      }
+
+      // myc-ncjz3ktdgvcd: абсолютный путь бинаря добрался до отслеживаемого
+      // git'ом конфига MCP. Молчать нельзя и здесь — человек должен узнать
+      // об этом в момент wire, а не когда путь его машины уедет в git.
+      for (const t of plan.trackedAbsolute) {
+        ctx.warn(
+          "wire.absolute_path_tracked",
+          t.kept
+            ? `${t.path} is tracked by git: the relative myc command already there (${t.command}) is kept, ` +
+              `the absolute MYC_BIN path (${t.bin}) was not written — a clone on another machine would not have it`
+            : `${t.path} is tracked by git and now carries the absolute path ${t.bin} — committing it publishes ` +
+              "this machine's path; prefer a repo-relative myc (e.g. ./dist/myc) or keep this change out of the commit",
         );
       }
 
@@ -1963,12 +2218,50 @@ export function createUnwireCommand(overrides: Partial<Pick<WireDeps, "env" | "p
             ? "; previous statusLine restored"
             : "";
         // В созданный нами opencode.json мы же положили и `$schema` — снимается с ним.
+        // То же для mimocode.json: остаток в виде голой схемы не пуст, и
+        // каталог `.mimocode` после снятия не удалился бы — wire оставлял бы
+        // мусор, которого до него не было.
         const rest = { ...stripped };
-        if (created && rest["$schema"] === OPENCODE_SCHEMA) delete rest["$schema"];
+        if (created) {
+          const schema = rest["$schema"];
+          if (schema === OPENCODE_SCHEMA || schema === MIMOCODE_SCHEMA) delete rest["$schema"];
+        }
         writeOrDrop(serializeJson(stripped, source.indent), Object.keys(rest).length === 0, `${entry.nodes.join(", ")}${restored}`);
       }
 
       if (!dryRun && kept.length === 0) rmSync(jPath, { force: true });
+
+      // ПУСТЫЕ КАТАЛОГИ, ОСТАВШИЕСЯ ОТ НАШИХ ФАЙЛОВ, ТОЖЕ УБИРАЕМ
+      // (memory-v30bvbp54qvc). Справка обещает «remove exactly what myc wire
+      // installed», а после снятия оставались `.claude/`, `.codex/`,
+      // `.kimi-code/`, `.opencode/` — пустые каталоги, которых до wire не
+      // было: человек видит их в `git status` и не знает, откуда они.
+      //
+      // Инструмент выбран НАМЕРЕННО: `rmdir` не удаляет непустой каталог, и
+      // это свойство, а не проверка — если внутри осталось хоть что-то
+      // чужое, каталог остаётся, и придумывать правила «наше/не наше» не
+      // требуется. Идём снизу вверх и останавливаемся на первом, который не
+      // поддался; выше корня воркспейса не поднимаемся никогда.
+      if (!dryRun) {
+        const base = resolve(root);
+        const dirs = new Set<string>();
+        for (const entry of journal.entries) {
+          let dir = dirname(resolve(base, entry.path));
+          while (dir.startsWith(`${base}/`)) {
+            dirs.add(dir);
+            dir = dirname(dir);
+          }
+        }
+        // Глубокие раньше мелких: иначе родитель ещё не пуст.
+        for (const dir of [...dirs].sort((a, b) => b.length - a.length)) {
+          try {
+            rmdirSync(dir);
+            removed.push(`${relative(base, dir)}/ (empty directory left by wire — removed)`);
+          } catch {
+            // Непустой или уже нет — обе причины законны, и обе молчат.
+          }
+        }
+      }
 
       const data: UnwireData = { removed, kept, gone, dry_run: dryRun };
       return { ok: true, data };
@@ -3203,7 +3496,7 @@ function planUserClaude(
 
   let queueBin: QueueBinChoice | null = null;
   if (ctx.flags["queue-hook"] === true) {
-    const probe = deps.probeQueue(paths.claudeDir, deps.env);
+    const probe = deps.probeQueue(paths.claudeDir, deps.env, "user");
     if (!probe.ok) {
       return {
         failure: failure(
@@ -3322,7 +3615,10 @@ function planUserClaude(
       }
     }
     hooks[event] = next;
-    nodes.push(`hooks.${event}`);
+    // Узел, совпадающий с записанным, не меняется — и в detail его не
+    // называют: «+N nodes» — это «что изменится», не «куда кладём руку»
+    // (memory-h744mh3f5ddy; правило то же, что у проектного mergeHookNodes).
+    if (!jsonSame(existing, next)) nodes.push(`hooks.${event}`);
   }
   if (nodes.length > 0) value["hooks"] = hooks;
 
@@ -3343,6 +3639,7 @@ function planUserClaude(
     );
   }
   // --- statusLine (только с --status-line; стоящая наша — сохраняется) ---------
+  const statusBefore = value["statusLine"];
   const sl = planUserStatusLine(value, {
     want: wantStatusLine,
     recorded: prev?.status_line,
@@ -3354,7 +3651,7 @@ function planUserClaude(
     return { failure: failure("conflict.status_line", `status line not installed, nothing written: ${sl.conflict}`, ExitCode.CONFLICT) };
   }
   notes.push(...sl.notes);
-  if (sl.node) nodes.push("statusLine");
+  if (sl.node && !jsonSame(statusBefore, value["statusLine"])) nodes.push("statusLine");
   if (!wantStatusLine && sl.record === undefined) untouched.push(`${show(paths.settings)}:statusLine (needs --status-line)`);
 
   const settingsContent = `${JSON.stringify(value, null, source.indent)}${layout.newline ? "\n" : ""}`;

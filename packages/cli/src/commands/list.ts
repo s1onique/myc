@@ -5,6 +5,7 @@
 
 import type { NodeKind, NodeRecord } from "@myc/core";
 import { ExitCode } from "../exit.ts";
+import { remoteRun } from "../remote.ts";
 import type { Command, CommandFailure } from "../registry.ts";
 import {
   flagNum,
@@ -141,17 +142,18 @@ export function createListCommand(deps: StoreDeps = realStoreDeps): Command {
   return {
     name: "list",
     summary: "list nodes with filters",
+    remote: true,
     flags: [
-      { name: "kind", value: "string", description: "comma-separated kinds (task,bug,epic,memory,…)" },
-      { name: "status", value: "string", description: "comma-separated statuses" },
-      { name: "priority", value: "string", description: "P0|P1|P2|P3 or 0|1|2|3 (comma ok)" },
+      { name: "kind", value: "string", list: true, description: "comma-separated kinds (task,bug,epic,memory,…)" },
+      { name: "status", value: "string", list: true, description: "comma-separated statuses" },
+      { name: "priority", value: "string", list: true, description: "P0|P1|P2|P3 or 0|1|2|3 (comma ok)" },
       { name: "tag", value: "string", description: "must carry this tag" },
       { name: "assignee", value: "string", description: "assignee, or 'free'" },
       { name: "acl", value: "string", description: "acl mode" },
       { name: "since", value: "string", description: "updated after: ISO date or age (2d, 6h)" },
       { name: "until", value: "string", description: "updated before: ISO date or age" },
       { name: "sort", value: "string", description: "priority|updated|created|status (default updated)" },
-      { name: "fields", value: "string", description: "comma-separated columns (json/ndjson shape)" },
+      { name: "fields", value: "string", list: true, description: "comma-separated columns (json/ndjson shape)" },
       { name: "n", short: "n", value: "number", description: "limit (default 20)" },
       { name: "offset", value: "number", description: "skip first N rows" },
       { name: "count", description: "print only the count" },
@@ -209,6 +211,39 @@ export function createListCommand(deps: StoreDeps = realStoreDeps): Command {
         until = parseBound(untilRaw, false);
         if (until === undefined) return failure("usage.invalid", `invalid --until '${untilRaw}'`, ExitCode.USAGE);
       }
+
+      // Сервер команды: список отдаёт он, и фильтры у него свои — те, что
+      // умеет эндпоинт. Неподдержанное НЕ игнорируется: отфильтровать молча
+      // меньше, чем просили, значит соврать про состав выдачи.
+      const remote = await remoteRun(ctx, async (client) => {
+        const unsupported = ["tag", "assignee", "acl", "until", "sort", "fields"].filter(
+          (f) => flagStr(ctx, f) !== undefined,
+        );
+        if (unsupported.length > 0) {
+          return failure(
+            "precond.no_remote",
+            `the server does not filter by ${unsupported.join(", ")} yet`,
+            ExitCode.PRECOND,
+          );
+        }
+        const answer = await client.listNodes({
+          kind: kindNames?.length === 1 ? KIND_FILTER[kindNames[0]!]!.kind : undefined,
+          status: flagStr(ctx, "status"),
+          since,
+          limit: typeof ctx.flags["n"] === "number" ? ctx.flags["n"] : undefined,
+          offset: typeof ctx.flags["offset"] === "number" ? ctx.flags["offset"] : undefined,
+        });
+        const rows = answer.data as unknown[];
+        if (ctx.flags["count"] === true) {
+          return { ok: true, data: { count: answer.meta["total"] ?? rows.length }, meta: { remote: client.ws } };
+        }
+        return {
+          ok: true,
+          data: rows,
+          meta: { ...answer.meta, remote: client.ws, took_ms: Math.round((performance.now() - t0) * 100) / 100 },
+        };
+      });
+      if (remote !== undefined) return remote;
 
       const opened = await deps.openStore(ctx);
       if (!opened.ok) return opened.failure;

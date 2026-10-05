@@ -106,9 +106,75 @@ export function placeholderNumbers(sql: string, marker: "?" | "$"): number[] {
   return found;
 }
 
+/**
+ * МЕХАНИЧЕСКИЙ ПЕРЕВОД ДИАЛЕКТА.
+ *
+ * Оверрайд `pg` пишут там, где запросы диалектов расходятся ПО СУЩЕСТВУ.
+ * Но два расхождения существа не имеют и встречаются в каждом втором запросе:
+ * подсказка индекса и чтение одного ключа из JSON. Написать их руками значило
+ * бы держать 27 копий одного SQL, расходящихся молча при первой же правке
+ * оригинала, — поэтому они переводятся здесь, один раз, и доказываются
+ * паритетом на живой базе (packages/server/src/parity.pg.test.ts).
+ *
+ *  - `INDEXED BY ix` — в SQLite это ТРЕБОВАНИЕ (запрос упадёт, если индекс не
+ *    подходит), им закреплён план горячих путей. В Postgres такого нет вовсе:
+ *    план выбирает планировщик. Подсказка снимается, результат от этого не
+ *    меняется — меняется только план, и об этом здесь сказано вслух.
+ *  - `json_extract(x,'$.k')` → `(x->>'k')`: ровно та же операция, один ключ
+ *    верхнего уровня, текстом в обоих диалектах. СКОБКИ ОБЯЗАТЕЛЬНЫ: в
+ *    Postgres у `->>` и `||` один приоритет и левая ассоциативность, поэтому
+ *    `'episode:' || attrs->>'k'` разбирается как `('episode:' || attrs)->>'k'`
+ *    — конкатенация jsonb вместо текста, и запрос падает на разборе JSON.
+ *    Поймано паритетом на реестре prime. Пути сложнее одного ключа
+ *    (массивы, вложенность) НЕ переводятся: их надо писать оверрайдом
+ *    осознанно, и сторож в tests ловит их появление в реестрах.
+ *
+ *  - `ON CONFLICT(<ключ>)` → `ON CONFLICT(tenant_id, <ключ>)`: в схеме
+ *    Postgres арендатор — ВЕДУЩАЯ колонка каждого уникального ключа (решение
+ *    memory-khj49brcr0q7), и цель конфликта, названная по-SQLite'овски, там
+ *    просто не соответствует ни одному индексу — Postgres отвечает «no unique
+ *    or exclusion constraint matching». Реестр пишет только таблицы
+ *    арендатора; серверные (tenants, api_tokens, учёт миграций) через него не
+ *    проходят, и правило к ним не применяется.
+ *
+ * Образцы пишутся по всему тексту, а не по «коду вне строк». Это допущение, и
+ * оно проверяется: ни один запрос реестров не содержит этих слов внутри
+ * строкового литерала (сторож — packages/cli/src/dialect-registries.test.ts).
+ */
+const INDEX_HINT = /\s+INDEXED\s+BY\s+[A-Za-z_][A-Za-z0-9_]*/gi;
+const CONFLICT_TARGET = /ON\s+CONFLICT\s*\(\s*(?!tenant_id\b)/gi;
+const JSON_ONE_KEY = /json_extract\s*\(\s*([A-Za-z_][A-Za-z0-9_.]*)\s*,\s*'\$\.([A-Za-z_][A-Za-z0-9_]*)'\s*\)/gi;
+
+export function toPgDialect(sql: string): string {
+  return toPgPlaceholders(sql)
+    .replace(INDEX_HINT, "")
+    .replace(JSON_ONE_KEY, "($1->>'$2')")
+    .replace(CONFLICT_TARGET, "ON CONFLICT(tenant_id, ");
+}
+
+/**
+ * Тот же перевод, но с явным приведением перечисленных мест к jsonb.
+ *
+ * Драйвер Bun отправляет JS-СТРОКУ в колонку `jsonb` как JSON-строку, то есть
+ * скаляр: `attrs` становится `"{}"` вместо `{}`, и следующий `jsonb_set`
+ * отвечает «cannot set path in scalar». Двойное приведение `$N::text::jsonb`
+ * заставляет драйвер послать параметр текстом, а базу — разобрать его как
+ * JSON. SQLite это не касается: там те же колонки — TEXT.
+ *
+ * Поймано apply.pg.test.ts: применитель писал узел, у которого attrs оказался
+ * строкой, и падал на первой же правке поля внутри attrs.
+ */
+export function toPgDialectJsonb(sql: string, ...jsonbParams: readonly number[]): string {
+  let out = toPgDialect(sql);
+  for (const n of jsonbParams) {
+    out = out.replace(new RegExp(`\\$${n}\\b(?!::)`, "g"), `$$${n}::text::jsonb`);
+  }
+  return out;
+}
+
 export function resolveQueryText(def: QueryDef, dialect: Dialect): string {
   if (dialect === "sqlite") return def.sql;
-  return def.pg ?? toPgPlaceholders(def.sql);
+  return def.pg ?? toPgDialect(def.sql);
 }
 
 export function validateQueryDef(def: QueryDef): void {

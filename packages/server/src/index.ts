@@ -23,8 +23,49 @@
 import { existsSync } from "node:fs";
 import { join } from "node:path";
 import { Database } from "bun:sqlite";
+import { openPostgres, type PostgresDriver } from "@myc/store-postgres";
+import { adminOverview, adminTenants, renderAdminPage } from "./admin.ts";
+import { aclParams, MYC_VERSION, type Viewer } from "@myc/core";
+import {
+  boundedInt,
+  parseWsPath,
+  renderNode,
+  wsList,
+  wsQueries,
+  WS_LIMIT_DEFAULT,
+  WS_LIMIT_MAX,
+} from "./ws.ts";
+import { primeDigest, readyQueue, READY_LIMIT_DEFAULT, READY_LIMIT_MAX } from "./ready.ts";
+import { syncExchange, validateSync } from "./sync.ts";
+import {
+  addEdge,
+  claimTask,
+  CLAIM_TTL_MS,
+  createNode,
+  removeEdge,
+  updateNode,
+  validateCreate,
+  validateEdge,
+  validateUpdate,
+} from "./write.ts";
+import {
+  authenticate,
+  clearCookie,
+  isSecureRequest,
+  sessionCookie,
+  tokenOf,
+  type Principal,
+  type Scope,
+  can,
+  seesWorkspace,
+} from "./auth.ts";
 
-export const SERVER_VERSION = "0.0.0";
+/**
+ * Версия сервера — та же, что у всего myc. Прежде здесь стоял ноль, и
+ * `/v1/health` образа отвечал «0.0.0»: проба не могла отличить старый
+ * контейнер от нового (проверено `docker compose up` 2026-09-29).
+ */
+export const SERVER_VERSION = MYC_VERSION;
 
 export type ServerConfig = {
   readonly port: number;
@@ -34,6 +75,20 @@ export type ServerConfig = {
   readonly dir?: string;
   /** Явный путь к базе — выигрывает у dir. */
   readonly db?: string;
+  /**
+   * Сервер команды (M4): строка подключения к Postgres. Задана — поднимается
+   * админка `/v1/admin` и её JSON (см. admin.ts). Не задана — сервер остаётся
+   * локальным health-срезом над SQLite, а маршруты админки честно отвечают
+   * 404 с причиной, а не пустой страницей.
+   */
+  readonly pg?: string;
+  /**
+   * Версия схемы, которую знает ЗАПУСТИВШИЙ бинарь. Приходит снаружи, а не
+   * вычисляется здесь: список миграций живёт в store-sqlite, от которого
+   * пакет сервера намеренно не зависит. Без неё `migrations_pending`
+   * отвечать нечем — а отвечать нулём, как было, значит врать.
+   */
+  readonly schemaKnown?: number;
 };
 
 export interface MycHttpServer {
@@ -261,6 +316,28 @@ export function buildIndexHealth(db: ReadDb): IndexHealth {
 // сервер
 // ---------------------------------------------------------------------------
 
+/**
+ * Конверт данных — ТОТ ЖЕ, что у CLI (§2.3): ok, cmd, ws, ts, data, meta, warn.
+ * Один формат на два входа стоит того: агент, научившийся читать вывод
+ * `myc --json`, читает и ответ сервера без второго парсера.
+ */
+function envelope(
+  cmd: string,
+  ws: string,
+  data: unknown,
+  meta: Readonly<Record<string, unknown>> = {},
+): Response {
+  return json({
+    ok: true,
+    cmd,
+    ws,
+    ts: new Date().toISOString(),
+    data,
+    meta: { degraded: [], ...meta },
+    warn: [],
+  });
+}
+
 function json(value: unknown, status = 200): Response {
   return new Response(JSON.stringify(value), {
     status,
@@ -278,20 +355,95 @@ function dbPathOf(config: ServerConfig): string {
  * старту: `/v1/health` отвечает всегда, состояние БД — у двух других
  * эндпоинтов (разделение liveness/readiness/quality, §8.4).
  */
+/** Страница входа: одно поле, один POST. Ни скриптов, ни внешних запросов. */
+function loginPage(error: string | null): string {
+  return `<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><title>myc — server sign-in</title>
+<style>body{font:14px/1.5 ui-monospace,Menlo,monospace;margin:6rem auto;max-width:26rem}
+ input{width:100%;padding:.5rem;font:inherit} button{margin-top:.5rem;padding:.5rem 1rem;font:inherit}
+ .err{color:#b00;margin:.5rem 0}</style></head><body>
+<h1>myc — server</h1>
+${error === null ? "" : `<p class="err">${error}</p>`}
+<form method="post" action="/v1/auth/session">
+ <label>access token<input type="password" name="token" autofocus autocomplete="off"></label>
+ <button type="submit">sign in</button>
+</form>
+<p>Ask whoever runs this server for a token: <code>myc serve --pg &lt;url&gt; --add-token &lt;tenant&gt;:&lt;name&gt;</code></p>
+</body></html>`;
+}
+
+const noPg = (): Response =>
+  json(
+    {
+      ok: false,
+      error: { code: "precond.no_pg", msg: "this route needs a Postgres server: start with --pg <url>" },
+    },
+    404,
+  );
+
+/**
+ * ОТКАЗ СЕРВЕРА ВСЕГДА КОНВЕРТ, ДАЖЕ КОГДА НИКТО ЕГО НЕ ЖДАЛ
+ * (memory-3h980j79swnh).
+ *
+ * До этой правки ошибка, вылетевшая мимо явных catch, доставалась Bun, и
+ * снаружи приходило `500 Something went wrong!` — страница по умолчанию:
+ * без кода, без причины, не JSON. Ловилось на самом вероятном отказе боевой
+ * установки: соединение с Postgres поднимается в `authenticate`, то есть
+ * РАНЬШЕ разбора маршрута и раньше любого catch внутри него, и при лежащей
+ * базе каждый запрос с токеном получал эту страницу. Клиент не мог отличить
+ * «токен не тот» от «база недоступна», а стек уходил в журнал контейнера,
+ * то есть причина была известна и не доезжала до спросившего.
+ *
+ * Классификация ОДНА и живёт здесь: недоступная база — 503 `db.query`
+ * (тем же кодом отвечает разбор внутри воркспейса, и второй код для того же
+ * события означал бы, что клиенту надо знать оба), всё прочее — 500
+ * `internal.unexpected`. Наружу идёт текст ошибки, но не стек: сообщение
+ * драйвера называет причину, трассировка называет наше устройство.
+ */
+export function failureEnvelope(e: unknown, cmd: string, ws?: string): Response {
+  const msg = e instanceof Error ? e.message : String(e);
+  // Признак драйвера, а не наш: у ошибок подключения Postgres код лежит в
+  // `errno`/`code` (ECONNREFUSED, ENOTFOUND) либо в тексте — «connection»,
+  // «terminated», «timeout». Классифицируем по обоим, потому что драйвер
+  // отдаёт разные формы на разрыв и на недоступность.
+  const code = (e as { code?: unknown } | null)?.code;
+  const down =
+    (typeof code === "string" && /^(ECONNREFUSED|ENOTFOUND|ECONNRESET|ETIMEDOUT|EHOSTUNREACH)$/.test(code)) ||
+    /connect|connection|terminated|timeout|socket|closed/i.test(msg);
+  return json(
+    down
+      ? { ok: false, cmd, ...(ws === undefined ? {} : { ws }), error: { code: "db.query", msg } }
+      : { ok: false, cmd, ...(ws === undefined ? {} : { ws }), error: { code: "internal.unexpected", msg } },
+    down ? 503 : 500,
+  );
+}
+
 export function startHttpServer(config: ServerConfig): MycHttpServer {
   const dbPath = dbPathOf(config);
   const startedAt = Date.now();
 
   const openDb = (): ReadDb => openReadOnly(dbPath);
+  // Одно соединение на весь процесс: у драйвера свой пул, а открывать его на
+  // каждый запрос значило бы платить рукопожатием за каждую страницу.
+  const pg: PostgresDriver | undefined = config.pg === undefined ? undefined : openPostgres(config.pg);
 
   const fetch = async (req: Request): Promise<Response> => {
-    const url = new URL(req.url);
-    if (req.method !== "GET") {
-      return json({ ok: false, error: { code: "usage.method", msg: "GET only" } }, 405);
+    // ЕДИНСТВЕННАЯ ГРАНИЦА, ЗА КОТОРУЮ ОШИБКА НЕ УХОДИТ. Внутри есть свои
+    // catch там, где отказ ожидаем и у него своё имя; этот — для всего
+    // остального, включая `authenticate`, который ходит в Postgres РАНЬШЕ
+    // разбора маршрута (memory-3h980j79swnh).
+    try {
+      return await route(req);
+    } catch (e) {
+      return failureEnvelope(e, "serve");
     }
+  };
+
+  const route = async (req: Request): Promise<Response> => {
+    const url = new URL(req.url);
 
     // liveness: процесс жив, базу не трогаем — 200 всегда
-    if (url.pathname === "/v1/health") {
+    if (url.pathname === "/v1/health" && req.method === "GET") {
       return json({
         ok: true,
         ver: SERVER_VERSION,
@@ -300,8 +452,127 @@ export function startHttpServer(config: ServerConfig): MycHttpServer {
       });
     }
 
+    // ГОТОВНОСТЬ: база жива и схема та, которую знает этот бинарь.
+    //
+    // ОТДЕЛЬНО ОТ ЖИВОСТИ, И ЭТО НЕ УДВОЕНИЕ (memory-e66rf6qv5qfk).
+    // `/v1/health` намеренно не трогает базу: контейнер жив, даже когда
+    // Postgres лёг, и оркестратор не должен перезапускать его из-за чужой
+    // аварии. Но тогда у развёртывания не остаётся способа сказать «я готов
+    // принимать работу»: проба отвечала `ok`, трафик шёл, и каждый запрос с
+    // токеном получал отказ. Две пробы отвечают на два разных вопроса.
+    //
+    // БЕЗ ТОКЕНА — и потому МОЛЧАЛИВАЯ. Пробу зовёт оркестратор, у которого
+    // токена нет и быть не должно; значит наружу нельзя отдавать ни версию
+    // схемы, ни текст ошибки базы — это сведения о системе. Достаточно
+    // ok/не-ok и кода причины.
+    if (url.pathname === "/v1/readyz" && req.method === "GET") {
+      if (pg === undefined) {
+        // Без Postgres сервер — локальный срез над SQLite: готовность
+        // совпадает с живостью, и врать про базу, которой нет, незачем.
+        return json({ ok: true, db: "sqlite" });
+      }
+      try {
+        await pg.raw("SELECT 1");
+        return json({ ok: true, db: "postgres" });
+      } catch {
+        return json({ ok: false, error: { code: "db.unavailable" } }, 503);
+      }
+    }
+
+    // ВХОД БРАУЗЕРА. Единственный POST на сервере: страница админки — обычная
+    // вкладка, и держать токен в адресной строке (журналы прокси, история,
+    // «поделись ссылкой») нельзя. Форма отдаёт его один раз, дальше работает
+    // кука: HttpOnly, SameSite=Strict, Secure за https.
+    if (url.pathname === "/v1/auth/session") {
+      if (pg === undefined) return noPg();
+      if (req.method === "POST") {
+        const form = await req.formData().catch(() => null);
+        const token = typeof form?.get("token") === "string" ? String(form.get("token")) : null;
+        const auth = await authenticate(pg, token);
+        if (!auth.ok) {
+          return new Response(loginPage("that token was not accepted"), {
+            status: 401,
+            headers: { "content-type": "text/html; charset=utf-8" },
+          });
+        }
+        return new Response(null, {
+          status: 303,
+          headers: {
+            location: "/v1/admin",
+            "set-cookie": sessionCookie(token!, isSecureRequest(req)),
+          },
+        });
+      }
+      if (req.method === "DELETE" || req.method === "GET") {
+        // Выход: кука снимается, токен при этом жив — отзывает его владелец.
+        return new Response(null, { status: 303, headers: { location: "/v1/admin", "set-cookie": clearCookie() } });
+      }
+    }
+
+    // ЗАПИСЬ ИДЁТ ТОЛЬКО В ДАННЫЕ ВОРКСПЕЙСА и только после проверки токена
+    // (она ниже). Всё остальное на сервере — чтение: отвечать «405 GET only»
+    // честнее, чем делать вид, что метод поддержан и просто не сработал.
+    if (req.method !== "GET" && parseWsPath(url.pathname) === null) {
+      return json({ ok: false, error: { code: "usage.method", msg: "GET only" } }, 405);
+    }
+
+    // ДОСТУП. Закрыто всё, кроме пробы живости выше: сервер стоит в сети, и
+    // health базы с составом деградаций — тоже сведения о системе. Без
+    // Postgres токенов нет вовсе, и тогда сервер остаётся локальным срезом:
+    // он слушает 127.0.0.1 по умолчанию, и закрывать его нечем и не от кого.
+    let who: Principal | undefined;
+    if (pg !== undefined) {
+      const auth = await authenticate(pg, tokenOf(req));
+      if (!auth.ok) {
+        // Браузеру — страница входа, машине — 401 с кодом.
+        const wantsHtml = (req.headers.get("accept") ?? "").includes("text/html");
+        if (wantsHtml) {
+          return new Response(loginPage(auth.code === "denied.no_token" ? null : "that token was not accepted"), {
+            status: 401,
+            headers: { "content-type": "text/html; charset=utf-8" },
+          });
+        }
+        return json({ ok: false, error: { code: auth.code, msg: auth.msg } }, 401);
+      }
+      who = auth.principal;
+    }
+
     // readiness: соединение, версия схемы, латентность — 503 при недоступной БД
     if (url.pathname === "/v1/health/db") {
+      // НА КОМАНДНОМ СЕРВЕРЕ БАЗА — POSTGRES, И СПРАШИВАТЬ НАДО ЕЁ. Прежде
+      // этот путь всегда открывал локальный файл SQLite, поэтому в
+      // контейнере проба готовности получала вечное
+      // `db.missing: no database file: /home/myc/.myc/myc.db` — то есть
+      // оркестратор держал бы исправный сервер вне ротации (найдено
+      // `docker compose up` 2026-09-29).
+      if (pg !== undefined) {
+        try {
+          const t0 = performance.now();
+          await pg.raw("SELECT 1");
+          const latency = Math.round((performance.now() - t0) * 100) / 100;
+          // По ОБЕИМ таблицам учёта: совместимые миграции лежат не в
+          // schema_migrations, и версия по одной из них занижена.
+          const [v] = await pg.raw<{ v: string | null }>(
+            `SELECT max(v) AS v FROM (
+               SELECT max(version) AS v FROM schema_migrations
+               UNION ALL SELECT max(version) AS v FROM schema_migrations_compat
+             ) t`,
+          );
+          // BIGINT приходит строкой; версия наружу — как у SQLite, `vN`.
+          const have = v?.v == null ? null : Number(v.v);
+          const schema = have === null ? null : `v${have}`;
+          // Отставание СЧИТАЕТСЯ, а не пишется литералом: раньше здесь стоял
+          // ноль, и проба уверяла, что догонять нечего, на любой базе.
+          const pending =
+            have === null || config.schemaKnown === undefined
+              ? null
+              : Math.max(0, config.schemaKnown - have);
+          return json({ ok: true, db: "postgres", latency_ms: latency, schema, migrations_pending: pending });
+        } catch (e) {
+          const msg = e instanceof Error ? e.message : String(e);
+          return json({ ok: false, error: { code: "db.query", msg } }, 503);
+        }
+      }
       let db: ReadDb;
       try {
         db = openDb();
@@ -364,6 +635,276 @@ export function startHttpServer(config: ServerConfig): MycHttpServer {
       }
     }
 
+    // Админка сервера (M4): состояние сервера и арендаторы. Только чтение.
+    if (url.pathname.startsWith("/v1/admin")) {
+      if (pg === undefined) return noPg();
+      // Админка показывает арендаторов и состояние сервера — это сведения о
+      // системе, и смотреть их вправе не всякий, кому выдали токен.
+      if (!can(who, "admin")) {
+        return json(
+          {
+            ok: false,
+            error: { code: "denied.scope", msg: "this token has no 'admin' scope" },
+          },
+          403,
+        );
+      }
+      try {
+        if (url.pathname === "/v1/admin/overview") {
+          const o = await adminOverview(pg);
+          return json({ ok: true, ...o, degraded: o.warn.map((w) => w.code) });
+        }
+        if (url.pathname === "/v1/admin/tenants") {
+          return json({ ok: true, tenants: await adminTenants(pg) });
+        }
+        if (url.pathname === "/v1/admin" || url.pathname === "/v1/admin/") {
+          const [o, tenants] = await Promise.all([adminOverview(pg), adminTenants(pg)]);
+          return new Response(renderAdminPage(o, tenants, who), {
+            headers: { "content-type": "text/html; charset=utf-8" },
+          });
+        }
+      } catch (e) {
+        const msg = e instanceof Error ? e.message : String(e);
+        return json({ ok: false, error: { code: "db.query", msg } }, 503);
+      }
+    }
+
+    // ---- данные воркспейса: /v1/ws и /v1/ws/:ws/… (§8.1) --------------------
+    if (url.pathname === "/v1/ws") {
+      if (pg === undefined) return noPg();
+      const t0 = performance.now();
+      const list = await wsList(pg, who!.tenant, { owner: who!.subject, team: "", agent: "" });
+      return envelope("ws", "", list, { took_ms: Math.round((performance.now() - t0) * 100) / 100, count: list.length });
+    }
+
+    const wsPath = parseWsPath(url.pathname);
+    if (wsPath !== null) {
+      if (pg === undefined) return noPg();
+      const { ws, rest } = wsPath;
+      const tenant = who!.tenant;
+      // Токен, привязанный к одному проекту, о чужих не узнаёт даже
+      // отказом: ответ тот же, что у несуществующего воркспейса.
+      // Кто смотрит. Владелец — subject токена; команда и агент пока не
+      // заводятся (их назначает выдача токена, §8.2), и пустые значения
+      // означают «такой принадлежности нет», а не «любая».
+      const viewer: Viewer = { owner: who?.subject ?? "", team: "", agent: "" };
+      const acl = aclParams(viewer);
+      if (!seesWorkspace(who, ws)) {
+        return json(
+          { ok: false, cmd: "ws", ws, error: { code: "notfound.ws", msg: `no workspace ${ws}` } },
+          404,
+        );
+      }
+      const t0 = performance.now();
+      const took = (): number => Math.round((performance.now() - t0) * 100) / 100;
+
+      try {
+        const needs = (scope: Scope): Response | undefined =>
+          can(who, scope)
+            ? undefined
+            : json(
+                {
+                  ok: false,
+                  cmd: "ws",
+                  ws,
+                  error: { code: "denied.scope", msg: `this token has no '${scope}' scope` },
+                },
+                403,
+              );
+
+        if ((rest === "/sync" || rest === "/sync/") && req.method === "POST") {
+          // Обмен требует СВОЕГО права: реплика полная, и предикат видимости
+          // её не фильтрует (auth.ts, SCOPES). Отдать её читателю значило бы
+          // отдать и чужое приватное.
+          const denied = needs("sync");
+          if (denied !== undefined) return denied;
+          const parsed = validateSync(await req.json().catch(() => null));
+          if (!parsed.ok) {
+            return json({ ok: false, cmd: "sync", ws, error: parsed.error }, 400);
+          }
+          const answer = await syncExchange(pg, tenant, ws, parsed.data, who!.subject);
+          return envelope("sync", ws, answer, {
+            took_ms: took(),
+            pushed: parsed.data.ops.length,
+            pulled: answer.ops.length,
+          });
+        }
+
+        if ((rest === "/nodes" || rest === "/nodes/") && req.method === "POST") {
+          const denied = needs("write");
+          if (denied !== undefined) return denied;
+          // Создание узла: сервер минтит операции и отдаёт их ТОМУ ЖЕ
+          // применителю, что и CLI (packages/server/src/write.ts).
+          const body = await req.json().catch(() => null);
+          const parsed = validateCreate(body);
+          if (!parsed.ok) {
+            return json({ ok: false, cmd: "node", ws, error: parsed.error }, 400);
+          }
+          const created = await createNode(pg, tenant, ws, parsed.data, who!.subject);
+          const [node] = await pg.withTenant(tenant, async (tx) => [
+            await tx.one<Record<string, unknown>>(wsQueries.ws_node_get, [ws, created.id, ...acl]),
+          ]);
+          return envelope("node", ws, node === undefined ? { id: created.id } : renderNode(node), {
+            took_ms: took(),
+            applied: created.applied,
+            collided: created.collided,
+          });
+        }
+
+        if ((rest === "/prime" || rest === "/prime/") && req.method === "GET") {
+          const q = url.searchParams;
+          const answer = await primeDigest(
+            pg,
+            tenant,
+            ws,
+            q.get("session") ?? "",
+            q.get("repo") ?? "",
+            boundedInt(q.get("n"), READY_LIMIT_DEFAULT, READY_LIMIT_MAX),
+            viewer,
+          );
+          return envelope("prime", ws, answer, { took_ms: took() });
+        }
+
+        if ((rest === "/ready" || rest === "/ready/") && req.method === "GET") {
+          const q = url.searchParams;
+          const limit = boundedInt(q.get("n"), READY_LIMIT_DEFAULT, READY_LIMIT_MAX);
+          const queue = await readyQueue(pg, tenant, ws, limit, viewer, q.get("repo") ?? "");
+          return envelope("ready", ws, queue.items, {
+            took_ms: took(),
+            count: queue.items.length,
+            total: queue.total,
+          });
+        }
+
+        if (rest === "/ready/claim" && req.method === "POST") {
+          const denied = needs("claim");
+          if (denied !== undefined) return denied;
+          const body = (await req.json().catch(() => null)) as Record<string, unknown> | null;
+          const id = typeof body?.["id"] === "string" ? body["id"] : "";
+          if (id === "") {
+            return json(
+              { ok: false, cmd: "claim", ws, error: { code: "usage.id", msg: "'id' is required" } },
+              400,
+            );
+          }
+          const minutes = body?.["lease_minutes"];
+          const ttl = minutes === undefined ? CLAIM_TTL_MS : Number(minutes) * 60_000;
+          // Держатель — владелец токена, а не поле запроса: иначе задачу можно
+          // взять от чужого имени, и «кто держит» перестанет что-либо значить.
+          const done = await claimTask(pg, tenant, ws, id, who!.subject, ttl);
+          if (!done.ok) {
+            const status =
+              done.error.code === "notfound.node" ? 404 : done.error.code === "usage.lease" ? 400 : 409;
+            return json({ ok: false, cmd: "claim", ws, error: done.error }, status);
+          }
+          return envelope("claim", ws, done.data, { took_ms: took() });
+        }
+
+        if (rest === "/edges" && (req.method === "POST" || req.method === "DELETE")) {
+          const denied = needs("write");
+          if (denied !== undefined) return denied;
+          const body = await req.json().catch(() => null);
+          const parsed = validateEdge(body);
+          if (!parsed.ok) {
+            return json({ ok: false, cmd: "edge", ws, error: parsed.error }, 400);
+          }
+          const done =
+            req.method === "POST"
+              ? await addEdge(pg, tenant, ws, parsed.data, who!.subject)
+              : await removeEdge(pg, tenant, ws, parsed.data, who!.subject);
+          if (!done.ok) {
+            return json(
+              { ok: false, cmd: "edge", ws, error: done.error },
+              done.error.code.startsWith("notfound.") ? 404 : 409,
+            );
+          }
+          return envelope("edge", ws, done.data, { took_ms: took() });
+        }
+
+        const onePath = /^\/nodes\/([^/]+)$/.exec(rest);
+        if (onePath !== null && req.method === "PATCH") {
+          const denied = needs("write");
+          if (denied !== undefined) return denied;
+          const body = await req.json().catch(() => null);
+          const parsed = validateUpdate(body);
+          if (!parsed.ok) {
+            return json({ ok: false, cmd: "node", ws, error: parsed.error }, 400);
+          }
+          const id = decodeURIComponent(onePath[1]!);
+          const done = await updateNode(pg, tenant, ws, id, parsed.data, who!.subject);
+          if (!done.ok) {
+            return json(
+              { ok: false, cmd: "node", ws, error: done.error },
+              done.error.code === "notfound.node" ? 404 : 400,
+            );
+          }
+          const [node] = await pg.withTenant(tenant, async (tx) => [
+            await tx.one<Record<string, unknown>>(wsQueries.ws_node_get, [ws, id, ...acl]),
+          ]);
+          return envelope("node", ws, node === undefined ? { id } : renderNode(node), {
+            took_ms: took(),
+            changed: done.data.changed,
+          });
+        }
+
+        if (req.method !== "GET") {
+          return json(
+            {
+              ok: false,
+              cmd: "ws",
+              ws,
+              error: { code: "usage.method", msg: `${req.method} is not supported on ${url.pathname}` },
+            },
+            405,
+          );
+        }
+
+        if (rest === "/nodes" || rest === "/nodes/") {
+          const q = url.searchParams;
+          const limit = boundedInt(q.get("limit"), WS_LIMIT_DEFAULT, WS_LIMIT_MAX);
+          const offset = boundedInt(q.get("offset"), 0, Number.MAX_SAFE_INTEGER);
+          const filters = [ws, q.get("kind") ?? "", q.get("status") ?? "", boundedInt(q.get("since"), 0, Number.MAX_SAFE_INTEGER)];
+          const [rows, counted] = await pg.withTenant(tenant, async (tx) => [
+            await tx.all<Record<string, unknown>>(wsQueries.ws_nodes_list, [...filters, limit, offset, ...acl]),
+            await tx.one<{ n: string | number }>(wsQueries.ws_nodes_count, [...filters, ...acl]),
+          ]);
+          return envelope("nodes", ws, rows, {
+            took_ms: took(),
+            count: rows.length,
+            total: Number(counted?.n ?? 0),
+            limit,
+            offset,
+          });
+        }
+
+        if (onePath !== null) {
+          const id = decodeURIComponent(onePath[1]!);
+          const [node, edges] = await pg.withTenant(tenant, async (tx) => [
+            await tx.one<Record<string, unknown>>(wsQueries.ws_node_get, [ws, id, ...acl]),
+            await tx.all<Record<string, unknown>>(wsQueries.ws_node_edges, [ws, id]),
+          ]);
+          // Чужой воркспейс отвечает ТЕМ ЖЕ, что несуществующий узел: иначе
+          // по разнице ответов перебирают, что есть у соседа.
+          if (node === undefined) {
+            return json(
+              { ok: false, cmd: "node", ws, error: { code: "notfound.node", msg: `no node ${id} in workspace ${ws}` } },
+              404,
+            );
+          }
+          return envelope("node", ws, { ...renderNode(node), edges }, { took_ms: took() });
+        }
+      } catch (e) {
+        // Та же классификация, что на внешней границе: два разбора одного
+        // события разъехались бы, и клиенту пришлось бы знать оба.
+        return failureEnvelope(e, "ws", ws);
+      }
+
+      return json(
+        { ok: false, cmd: "ws", ws, error: { code: "notfound.route", msg: `no route ${url.pathname}` } },
+        404,
+      );
+    }
+
     return json(
       { ok: false, error: { code: "notfound.route", msg: `no route ${url.pathname}` } },
       404,
@@ -385,6 +926,7 @@ export function startHttpServer(config: ServerConfig): MycHttpServer {
     host,
     dbPath,
     stop(): void {
+      void pg?.close();
       server.stop(true);
     },
   };

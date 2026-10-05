@@ -12,6 +12,7 @@ import {
   type CommandResult,
   type Globals,
 } from "./registry.ts";
+import { MYC_VERSION } from "@myc/core";
 import {
   isIterable,
   renderDataHuman,
@@ -19,7 +20,8 @@ import {
   renderWarnLines,
 } from "./render.ts";
 
-export const CLI_VERSION = "0.3.14";
+/** Версия одна на весь проект и живёт в ядре (packages/core/src/version.ts). */
+export const CLI_VERSION = MYC_VERSION;
 
 export type RunResult = {
   code: ExitCode;
@@ -140,6 +142,35 @@ function usageFailure(
   };
 }
 
+/**
+ * Команды, умеющие сервер. Список берётся из РЕЕСТРА, а не пишется рядом:
+ * разъехавшись, он врал бы человеку в подсказке ровно тогда, когда тот уже
+ * ошибся.
+ */
+function remoteCapable(registry: Registry): string[] {
+  return registry.top
+    .flatMap((c) => [c, ...(c.subcommands ?? [])].map((x) => ({ c: x, top: c })))
+    .filter(({ c }) => c.remote === true)
+    .map(({ c, top }) => (c === top ? c.name : `${top.name} ${c.name}`))
+    .sort();
+}
+
+function failureResult(failure: CommandFailure, globals: Globals, cmd: string): RunResult {
+  const diags = new Diagnostics();
+  if (globals.json || globals.ndjson) {
+    return { code: failure.exit, stdout: failureEnvelopeLine(cmd, failure, diags) };
+  }
+  return {
+    code: failure.exit,
+    stdout: "",
+    stderr: renderErrorHuman(
+      { code: failure.code, msg: failure.msg, hint: failure.hint },
+      diags,
+      globals.color,
+    ),
+  };
+}
+
 function failureEnvelopeLine(
   cmd: string,
   failure: CommandFailure,
@@ -255,6 +286,26 @@ export async function run(
       globals,
       cmd,
       `subcommands: ${subs.join(", ")}`,
+    );
+  }
+
+  // СЕРВЕР ЗАДАН — КОМАНДА ОБЯЗАНА ЕГО УМЕТЬ. Молча уйти в локальную базу
+  // нельзя: это не «запасной путь», а подмена данных под руками у человека.
+  const serverAsked =
+    typeof flags["server"] === "string"
+      ? String(flags["server"]).trim() !== ""
+      : ((options.env?.MYC_SERVER ?? process.env.MYC_SERVER) ?? "").trim() !== "";
+  if (serverAsked && command.remote !== true) {
+    return failureResult(
+      {
+        ok: false,
+        code: "precond.no_remote",
+        msg: `command '${cmd}' works only with a local database: it cannot talk to a server yet`,
+        exit: ExitCode.PRECOND,
+        hint: "commands that can: " + remoteCapable(registry).join(", "),
+      },
+      globals,
+      cmd,
     );
   }
 

@@ -120,6 +120,7 @@ const EXCEPTIONS: readonly Exception[] = [
     "packages/swarm/src/migrations/003-swarm-attempt.ts",
     "packages/swarm/src/migrations/006-swarm-attempt-run.ts",
     "packages/swarm/src/migrations/008-harness-codex.ts",
+    "packages/swarm/src/migrations/010-harness-mcode-mimo.ts",
   ].map((file) => ({ file, symbol: "SQL", reason: MIGRATION_REASON })),
 ];
 

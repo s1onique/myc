@@ -26,6 +26,7 @@ import {
   createTaskCommand,
   createUpdateCommand,
 } from "./tasks.ts";
+import { realStoreDeps } from "./store.ts";
 import { createShowCommand } from "./show.ts";
 import { createListCommand } from "./list.ts";
 import { createDepCommand } from "./dep.ts";
@@ -49,12 +50,16 @@ function makeRegistry(): Registry {
   r.register(createDepCommand());
   r.register(createReadyCommand());
   r.register(createMsgCommand());
-  r.register(createCommentCommand());
+  r.register(createCommentCommand(realStoreDeps, async () => pipedStdin));
   r.register(createEpicCommand());
   return r;
 }
 
+/** Что «пришло трубой» в этом тесте: подменяемый stdin команды comment. */
+let pipedStdin = "";
+
 beforeEach(async () => {
+  pipedStdin = "";
   process.env.MYC_ACTOR = "tester";
   dir = mkdtempSync(join(tmpdir(), "myc-cmd-"));
   mkdirSync(join(dir, ".myc"));
@@ -955,5 +960,62 @@ describe("--anchor вне корня репозитория", () => {
     } finally {
       rmSync(outside, { recursive: true, force: true });
     }
+  });
+});
+
+/**
+ * memory-qkzery4s28rv: справка команды обещает, что `-` читает stdin, а на
+ * деле это делал только `-b -`. Позиционный дефис уходил в тело как есть —
+ * БЕЗ отказа и с кодом 0, поэтому агент шёл дальше в уверенности, что отчёт
+ * записан, а в треде оставался дефис. Ловится это только поведением: «текст
+ * не тот» здесь важнее, чем «команда упала».
+ */
+describe("comment: обе двери к stdin ведут в одно место", () => {
+  test("позиционный '-' читает stdin, а не пишет дефис", async () => {
+    const id = (await mycJson("task", "проба")).env.data as { id: string };
+    pipedStdin = "отчёт из трубы\n";
+    const out = await mycJson("comment", id.id, "-");
+    expect(out.code).toBe(ExitCode.OK);
+    const d = out.env.data as { title: string; body_stdin_chars?: number };
+    expect(d.title).toBe("отчёт из трубы");
+    // И это именно труба, а не позиционный текст: команда сама называет,
+    // сколько символов пришло со stdin.
+    expect(d.body_stdin_chars).toBe("отчёт из трубы".length);
+  });
+
+  test("`-b -` читает тот же stdin — обе формы дают одно тело", async () => {
+    const id = (await mycJson("task", "проба")).env.data as { id: string };
+    pipedStdin = "отчёт из трубы\n";
+    const out = await mycJson("comment", id.id, "-b", "-");
+    expect(out.code).toBe(ExitCode.OK);
+    const d = out.env.data as { title: string; body_stdin_chars?: number };
+    expect(d.title).toBe("отчёт из трубы");
+    // И это именно труба, а не позиционный текст: команда сама называет,
+    // сколько символов пришло со stdin.
+    expect(d.body_stdin_chars).toBe("отчёт из трубы".length);
+  });
+
+  test("тот же текст ко ВТОРОМУ узлу записывается, а не падает сырым UNIQUE", async () => {
+    // memory-rnavnw2zbf4y: два разных ответа вправе совпасть дословно —
+    // «ок», «сделал», один и тот же отчёт к двум задачам. Прежде второй
+    // падал `internal.unexpected: UNIQUE constraint failed`, то есть агент
+    // читал «myc сломан» там, где сломано было ожидание.
+    const a = (await mycJson("task", "первая")).env.data as { id: string };
+    const b = (await mycJson("task", "вторая")).env.data as { id: string };
+    const first = await mycJson("comment", a.id, "сделал");
+    const second = await mycJson("comment", b.id, "сделал");
+    expect([first.code, second.code]).toEqual([ExitCode.OK, ExitCode.OK]);
+    // Это РАЗНЫЕ узлы, прицепленные к разным задачам.
+    const one = first.env.data as { id: string; replies_to: string };
+    const two = second.env.data as { id: string; replies_to: string };
+    expect(one.id).not.toBe(two.id);
+    expect([one.replies_to, two.replies_to]).toEqual([a.id, b.id]);
+  });
+
+  test("пустая труба — отказ, а не пустой комментарий", async () => {
+    const id = (await mycJson("task", "проба")).env.data as { id: string };
+    pipedStdin = "   \n";
+    const out = await mycJson("comment", id.id, "-");
+    expect(out.code).toBe(ExitCode.USAGE);
   });
 });

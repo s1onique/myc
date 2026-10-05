@@ -30,19 +30,25 @@ The runtime is bound to `bun:sqlite` (no native bindings on the Node side).
 **It will not start on plain Node.js or Deno.** Bun ≥ 1.3.0 is required and
 pinned in `package.json` → `engines.bun`.
 
-**SQLite ≥ 3.44.0.** Below 3.44.0, FTS5 cannot be written from triggers under
-`trusted_schema = OFF`, so every write fails. On Linux, Bun links its own SQLite
-(3.53.0 in Bun 1.3.14). On macOS, Bun uses the system SQLite — 3.43.2 on
-macOS 14 — so the package ships its own: `vendor/sqlite/libmyc-sqlite3.dylib`,
+**SQLite ≥ 3.50.4.** The floor has two reasons. Below 3.44.0, FTS5 cannot be
+written from triggers under `trusted_schema = OFF`, so every write fails. And on
+3.43.2 and 3.46.0, parallel myc processes were measured running one background
+job two or three times, with a failing job reporting "database disk image is
+malformed"; the cause is not known, so myc refuses every library below what a
+supported setup gives it. Nothing supported loses anything: on Linux, Bun links
+its own SQLite (3.50.4 in Bun 1.3.0, the minimum in `engines.bun`; 3.53.0 in
+Bun 1.3.14), and on macOS, where Bun would use the system SQLite — 3.43.2 on
+macOS 14 — the package ships its own: `vendor/sqlite/libmyc-sqlite3.dylib`,
 SQLite 3.53.4 built from the official amalgamation for arm64 and x86_64
 (`scripts/build-sqlite.ts`), chosen before anything else except an explicit
 `MYC_SQLITE=/path/to/libsqlite3.dylib`. If the SQLite in use is still below
-3.44.0 — a broken install, or `MYC_SQLITE` pointing at an old library — every
-command, `myc init` included, refuses with `precond.sqlite_unsupported` and says
-what to do, instead of creating a workspace it cannot write to. From 3.44.0 up
-to 3.51.2 myc works but warns (`WARN degraded.sqlite_old`): parallel processes
-may run a background job more than once; on Linux the cure is `bun upgrade`.
-`myc doctor` names the SQLite in use and where it came from.
+3.50.4 — a broken install, an unsupported Bun, or `MYC_SQLITE` pointing at an
+old library — every command, `myc init` included, refuses with
+`precond.sqlite_unsupported` and says what to do, instead of creating a
+workspace it cannot write to. From 3.50.4 up to 3.51.2 myc works but warns
+(`WARN degraded.sqlite_old`): that band is not proven safe for the queue, and on
+Linux the cure is `bun upgrade`. `myc doctor` names the SQLite in use and where
+it came from.
 
 Install Bun: https://bun.sh
 
@@ -51,8 +57,8 @@ Install Bun: https://bun.sh
 Installation is one command:
 
 ```bash
-bun install -g @aistastudio/myc   # 5.06 MB compressed, 15.63 MB unpacked, 16 files; no models pulled
-myc --version                     # myc 0.3.14 (schema 1)
+bun install -g @aistastudio/myc   # 5.11 MB compressed, 15.82 MB unpacked, 16 files; no models pulled
+myc --version                     # myc 0.4.4 (schema 1)
 ```
 
 It runs on macOS and Linux. On Windows, use WSL and install Bun and myc inside
@@ -84,7 +90,7 @@ source build, `./dist/myc` instead of `myc`.)
 
 ```bash
 myc init                     # .myc/ + SQLite + migrations in this repo
-myc wire                     # hooks + MCP for Claude Code, Codex, opencode and Kimi
+myc wire                     # hooks + MCP for Claude Code, Codex, opencode, Kimi, mcode and mimo
 myc ready --claim            # take the next task
 myc show <id>                # all that is known about it
 myc close <id>
@@ -228,7 +234,7 @@ and `run`, `statusline --then`, `wire` and `unwire` ask.
 Code intelligence is built in, and it is the same engine the alternatives use:
 tree-sitter, with grammars fetched on demand rather than shipped. Symbols,
 callers and code search work for TypeScript, TSX, JavaScript (js, jsx, mjs,
-cjs) and Python — the languages myc has definition rules for. The grammar
+cjs), Python and C# — the languages myc has definition rules for. The grammar
 package holds 36; a language is added as a pair, a rule and a catalog entry,
 so a grammar that would yield no symbols is never offered. Every other file
 still gets `code grep`, anchors and staleness.
@@ -460,8 +466,9 @@ last-writer-wins over whole records.
 
 **Guards are proved by mutation.** Every refusal and every invariant is
 accompanied by a mutation that removes it; a guard whose removal breaks no test
-is treated as absent. The full suite: 3882 pass / 0 fail / 16 skip
-(`bun test`, 2026-09-16).
+is treated as absent. The full suite: 4209 pass / 1 fail / 16 skip
+(`bun test`, 2026-10-04; the fail is the orca status-line classifier test
+against the installed Orca.app chunks).
 
 ## What myc does
 
@@ -471,8 +478,9 @@ ranked hybrid search; the code index above; hooks and MCP for four agents;
 the machine-wide queue for heavy commands; the status line; import from beads;
 a local web interface (`myc viz`: graph, queue, board, cards, search, health —
 edits go through the same write path as the CLI); git worktrees and nested
-repositories; sync through git and a `doctor` that compares claims with a
-recount.
+repositories; a team server over Postgres with tokens, roles and ACL
+(`myc serve`, see below); sync through git or through that server; and a
+`doctor` that compares claims with a recount.
 
 The full list — each capability with the release it arrived in and a command
 that shows it on your machine, every command checked against this build's
@@ -492,14 +500,84 @@ In short: the core, memory, semantics and the human interface (M0–M2, M7) are
 done or nearly done, and so is English output for every CLI and MCP line; code
 intelligence (M3, including the built-in replacement for graft) and the
 heavy-command queue have shipped, with tasks still open; the team milestone
-(M4: `myc serve`, ACL, network sync, Postgres) is mostly design; swarm
-self-learning (M5: routing by cost and outcome, with a shared pool of agent
-statistics) and distillation (M6) have not started.
+(M4: `myc serve`, ACL, network sync, Postgres) is built and running — 10 of its
+15 tasks are closed, and what is left is its own acceptance (a week of two
+people and four agents on one server), hybrid search on Postgres, SSE deltas,
+the `leader` and `full` MCP profiles, and a bulk SQLite→Postgres migration;
+swarm self-learning (M5: routing by cost and outcome, with a shared pool of
+agent statistics) and distillation (M6) have not started.
 
-What that means in practice: **today myc is a single-user local tool over files
-in git.** There is no server, no ACL and no team mode. Those are designed
-(`docs/design/03-interfaces-and-integration.md`,
-`docs/design/04-swarm-learning-and-routing.md`) and tracked, not implemented.
+What that means in practice: **myc is a local tool first, and a team server
+second — and the two are not the same thing.** Everything works locally over
+files in git. The server exists, is tested against a live Postgres and is
+described below, but only part of the CLI speaks to it; the rest refuses out
+loud rather than quietly writing somewhere else.
+
+## The team server
+
+One command gives a server you can actually use — no manual steps:
+
+```bash
+docker compose -f deploy/compose.yml up -d
+docker compose -f deploy/compose.yml logs server | grep 'bootstrap token'
+```
+
+Postgres runs the schema itself on an empty volume, and the server registers
+the first tenant and mints the first token from `MYC_BOOTSTRAP_*`. That sample
+deployment is not production: the password is in the open, there is no TLS,
+and the database sits in a volume next to it. TLS is the deployment's job —
+put a reverse proxy in front and let it set `X-Forwarded-Proto`.
+
+Without containers it is the same binary:
+
+```bash
+myc serve --pg postgres://myc_app:…@host/myc --apply-schema   # empty db only
+myc serve --pg … --add-tenant acme
+myc serve --pg … --add-token acme:anna --role owner           # secret printed once
+myc serve --pg … --port 8080
+```
+
+Everything but the liveness probe `/v1/health` needs a token. A token stores
+only its sha256, so a copy of the database gives no access and nobody can read
+a secret back. Roles are `owner`, `maintainer`, `member`, `agent`, `viewer`;
+rights are `read`, `write`, `claim`, `sync`, `admin`, and `--scopes` narrows
+what a role means. `sync` is deliberately not part of `read`: a replica is not
+filtered by the visibility predicate, so the right to pull one is the right to
+see everything in the workspace. The admin page at `/v1/admin` asks a browser
+for a token in a form and keeps it in an HttpOnly, SameSite=Strict cookie.
+
+A client points at the server through the environment, never the command line
+(arguments are visible in `ps`, in shell history and in hook logs):
+
+```bash
+export MYC_SERVER=https://myc.example/acme   # workspace in the path
+export MYC_TOKEN=myc_…
+myc ready
+```
+
+**Only part of the CLI speaks to a server, and this is the important part.**
+Working remotely today: `create`/`task`/`bug`/`epic`/`msg`, `update`, `claim`,
+`list`, `ready`, `show`, `prime` and `sync`. Everything else — `close`,
+`remember`, `recall`, `comment`, `link`, `dep`, `attempt`, `search`, `code` —
+refuses with `precond.no_remote` instead of silently using the local database,
+because seeing someone else's tasks and taking them for the team's is worse
+than an error. So the server is a place where replicas **meet**, not yet a
+place where the whole working loop lives.
+
+That is why the normal shape today is: every machine keeps its own local
+workspace and exchanges through the server.
+
+```bash
+myc sync                 # both ways; --push-only, --pull-only, --dry-run
+```
+
+The exchange carries operations, not rows: deduplicated by `op_id`, replayed
+through the same CRDT path as a git merge (per-field LWW, add-wins edges,
+G-counters), with a cursor per site, so repeating it changes nothing and an
+interrupted exchange resumes.
+
+Step by step, for a real host with TLS, tokens per person, backups and what
+to do when something refuses: [`docs/deploy.md`](docs/deploy.md).
 
 ## Syncing between machines
 

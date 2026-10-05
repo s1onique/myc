@@ -1,0 +1,474 @@
+/**
+ * `myc serve` — сервер команды (M4): HTTP, админка, Postgres.
+ *
+ * ЧЕМ ОН ОТЛИЧАЕТСЯ ОТ `myc viz`. viz — это личный просмотрщик ЛОКАЛЬНОЙ базы:
+ * слушает 127.0.0.1, ничего не спрашивает, потому что спрашивать не у кого —
+ * за клавиатурой тот же человек, чья это база. serve стоит в сети и служит
+ * команде: у него Postgres, арендаторы и токены, и он закрыт по умолчанию.
+ *
+ * ТРИ РЕЖИМА В ОДНОЙ КОМАНДЕ, И ЭТО НАМЕРЕННО. Выдать токен, посмотреть
+ * список, отозвать — действия администратора того же сервера, и отдельное
+ * дерево команд (`myc token add/ls/rm`) означало бы новую поверхность ради
+ * трёх глаголов. Здесь они флагами: команда что-то одно делает и выходит, а
+ * без них — поднимает сервер и ждёт сигнала.
+ *
+ * СЕКРЕТ ПЕЧАТАЕТСЯ ОДИН РАЗ. В базе лежит только его хеш (auth.ts), и
+ * повторно узнать токен нельзя — ни человеку, ни серверу. Поэтому вывод
+ * `--add-token` говорит об этом прямо, а не оставляет догадываться.
+ */
+
+import { openPostgres, type PostgresDriver } from "@myc/store-postgres";
+// Схема едет ВНУТРИ бинаря: контейнеру иначе пришлось бы возить psql и копию
+// файла, а «быстрый деплой» — это когда разворачивают одну вещь, а не три.
+import POSTGRES_DDL from "../../../../db/schema.postgres.sql" with { type: "text" };
+import {
+  canBypassRls,
+  knownSchemaVersion,
+  migratePostgres,
+  pgSchemaVersion,
+  type PgMigrateResult,
+} from "../pg-migrate.ts";
+import { addToken, isRole, listTokens, parseScopes, revokeToken, ROLES, SCOPES } from "@myc/server/auth";
+import { startHttpServer } from "@myc/server";
+import { CLI_VERSION } from "../index.ts";
+import { ExitCode } from "../exit.ts";
+import type { Command, CommandContext, CommandFailure, CommandResult } from "../registry.ts";
+
+function failure(code: string, msg: string, exit: ExitCode, hint?: string): CommandFailure {
+  return { ok: false, code, msg, exit, hint };
+}
+
+export interface ServeDeps {
+  readonly write: (s: string) => void;
+  /** Ожидание сигнала — тот же приём, что у viz: в тестах подменяется. */
+  readonly wait: () => Promise<string>;
+  /** Окружение: отсюда берётся первый арендатор контейнера (MYC_BOOTSTRAP_*). */
+  readonly env?: NodeJS.ProcessEnv;
+}
+
+export interface ServeStopped {
+  readonly url: string;
+  readonly port: number;
+  readonly pg: boolean;
+  readonly signal: string;
+  readonly uptime_ms: number;
+}
+
+export interface TokenAdded {
+  readonly id: string;
+  readonly tenant: string;
+  readonly subject: string;
+  /** Секрет. Печатается один раз — в базе его нет. */
+  readonly token: string;
+  readonly role: string;
+  readonly scopes: string;
+  /** Пусто — все воркспейсы арендатора. */
+  readonly ws: string;
+}
+
+function waitForSignal(): Promise<string> {
+  return new Promise((resolve) => {
+    const done = (sig: string) => (): void => {
+      process.off("SIGINT", onInt);
+      process.off("SIGTERM", onTerm);
+      resolve(sig);
+    };
+    const onInt = done("SIGINT");
+    const onTerm = done("SIGTERM");
+    process.once("SIGINT", onInt);
+    process.once("SIGTERM", onTerm);
+  });
+}
+
+function str(ctx: CommandContext, name: string): string | undefined {
+  const v = ctx.flags[name];
+  return typeof v === "string" && v.length > 0 ? v : undefined;
+}
+
+function num(ctx: CommandContext, name: string): number | undefined {
+  const v = ctx.flags[name];
+  if (typeof v === "number") return v;
+  if (typeof v === "string") {
+    const n = Number(v);
+    return Number.isFinite(n) ? n : undefined;
+  }
+  return undefined;
+}
+
+/**
+ * Завести первого арендатора и первый токен, если о них попросили
+ * окружением. Возвращает строку для журнала или `undefined`, когда делать
+ * нечего — молчание здесь важнее вежливости: пустых строк в журнале
+ * контейнера и так хватает.
+ */
+export async function bootstrapTenant(
+  pg: PostgresDriver,
+  env: NodeJS.ProcessEnv,
+): Promise<string | undefined> {
+  const tenant = (env["MYC_BOOTSTRAP_TENANT"] ?? "").trim();
+  if (tenant === "") return undefined;
+  const lines: string[] = [];
+  const made = await pg.raw<{ id: string }>(
+    `INSERT INTO tenants (id, title, created_at) VALUES ($1, '', $2)
+     ON CONFLICT (id) DO NOTHING RETURNING id`,
+    [tenant, Date.now()],
+  );
+  if (made.length > 0) lines.push(`bootstrap tenant ${tenant} registered`);
+
+  const name = (env["MYC_BOOTSTRAP_TOKEN"] ?? "").trim();
+  if (name !== "") {
+    // Живой токен у арендатора уже есть — второй не нужен и печатать нечего.
+    const live = await pg.raw<{ n: number | string }>(
+      "SELECT count(*) AS n FROM api_tokens WHERE tenant_id = $1 AND revoked_at IS NULL",
+      [tenant],
+    );
+    if (Number(live[0]?.n ?? 0) === 0) {
+      const minted = await addToken(pg, tenant, name, { role: "owner" });
+      lines.push(
+        `bootstrap token ${minted.id} for ${name} @ ${tenant} · owner`,
+        minted.token,
+        "This is the only time the secret is shown, and it is in the container log:",
+        "a real install drops MYC_BOOTSTRAP_* and mints tokens by hand.",
+      );
+    }
+  }
+  return lines.length === 0 ? undefined : `${lines.join("\n")}\n`;
+}
+
+export function createServeCommand(deps: ServeDeps = { write: (s) => process.stdout.write(s), wait: waitForSignal }): Command {
+  return {
+    name: "serve",
+    summary: "run the team server: HTTP API and the admin page over Postgres",
+    flags: [
+      { name: "port", value: "number", description: "port (default 8080)" },
+      { name: "host", value: "string", description: "bind address (default 127.0.0.1; use 0.0.0.0 behind a proxy)" },
+      { name: "pg", value: "string", description: "Postgres URL; without it the server is a local health slice over SQLite" },
+      { name: "add-tenant", value: "string", description: "register a tenant: <id>[:title]; tokens are issued under it" },
+      { name: "add-token", value: "string", description: "mint an access token: <tenant>:<name>; the secret is printed once" },
+      // Роль и права ОБЪЯВЛЕНЫ, а не только прочитаны (memory-c1m2apmnhf42):
+      // без объявления разбор отвергал их как неизвестные, и выпустить можно
+      // было только member — а у member нет права `sync`, то есть токен для
+      // обмена не выдавался из CLI вовсе.
+      { name: "role", value: "string", description: `role of the new token: ${ROLES.join("|")} (default member)` },
+      {
+        // list: true — обещание из описания: запятая значит, что флаг
+        // накапливается, а не съедает предыдущее значение. Сторож
+        // flags.list.test.ts держит это соответствие.
+        name: "scopes",
+        value: "string",
+        list: true,
+        description: `narrow the role's rights: comma-separated ${SCOPES.join(",")} (default: whatever the role means)`,
+      },
+      { name: "token-ws", value: "string", description: "bind the new token to one workspace (default: every workspace of the tenant)" },
+      { name: "revoke-token", value: "string", description: "revoke a token by its id" },
+      { name: "tokens", description: "list tokens: who holds them and when each was last used, never the secrets" },
+      { name: "apply-schema", description: "create the schema in an EMPTY database and exit; an existing one is left alone" },
+      { name: "migrate", description: "bring an existing database up to this binary's schema and exit; says what it applied" },
+      { name: "health-probe", description: "ask a server already running on this host whether it is alive, and exit 0 or 1" },
+    ],
+    help:
+      "The team server is closed by default: every route except the liveness probe (/v1/health) " +
+      "needs an access token, and the admin page at /v1/admin asks for one in a form and then " +
+      "keeps it in an HttpOnly, SameSite=Strict cookie.\n\n" +
+      "A token is issued per person or agent under one tenant: `--add-token acme:anna` prints the " +
+      "secret once and stores only its sha256 — a copy of the database gives no access, and " +
+      "nobody can read the secret back. Revoking is one row: `--revoke-token tok_…`.\n\n" +
+      "TLS is the deployment's job, not the server's: put it behind a reverse proxy and let it " +
+      "set X-Forwarded-Proto, so the session cookie is issued with Secure.\n\n" +
+      "Two probes answer two different questions and neither needs a token: /v1/health is liveness — the " +
+      "process is up, and it deliberately never touches the database, so someone else's outage does not get " +
+      "the container restarted; /v1/readyz is readiness — the database answers, so work can be accepted.\n\n" +
+      "Without --pg there are no tenants and no tokens: the server then serves the health trio " +
+      "over the local SQLite workspace and binds 127.0.0.1, as `myc viz` does.",
+    handler: async (ctx: CommandContext): Promise<CommandResult> => {
+      const port = num(ctx, "port") ?? Number(process.env["MYC_SERVE_PORT"] ?? 8080);
+
+      // ПРОБА ЖИВОСТИ ДЛЯ КОНТЕЙНЕРА. В образе нет ни curl, ни wget — и не
+      // должно быть: чем меньше в нём лежит, тем меньше в нём чинить. Пробу
+      // делает сам бинарь, и спрашивает он единственный открытый маршрут,
+      // ничего не зная о базе: упавший Postgres — не повод перезапускать
+      // процесс, который честно отвечает «жив».
+      if (ctx.flags["health-probe"] === true) {
+        const at = `http://127.0.0.1:${port}/v1/health`;
+        try {
+          const res = await fetch(at, { signal: AbortSignal.timeout(2000) });
+          if (!res.ok) {
+            return failure("degraded.not_alive", `${at} answered ${res.status}`, ExitCode.DEGRADED);
+          }
+          const body = (await res.json()) as { ok?: boolean; uptime_s?: number };
+          return { ok: true, data: { alive: body.ok === true, uptime_s: body.uptime_s ?? null, url: at } };
+        } catch (e) {
+          const msg = e instanceof Error ? e.message : String(e);
+          return failure("degraded.not_alive", `${at} did not answer: ${msg}`, ExitCode.DEGRADED);
+        }
+      }
+
+      const pgUrl = str(ctx, "pg") ?? process.env["MYC_PG_URL"];
+      const addTenant = str(ctx, "add-tenant");
+      const addSpec = str(ctx, "add-token");
+      const revokeId = str(ctx, "revoke-token");
+      const wantList = ctx.flags["tokens"] === true;
+      const applySchema = ctx.flags["apply-schema"] === true;
+      const wantMigrate = ctx.flags["migrate"] === true;
+
+      if (
+        (addSpec !== undefined || addTenant !== undefined || revokeId !== undefined || wantList || applySchema || wantMigrate) &&
+        pgUrl === undefined
+      ) {
+        return failure("precond.no_pg", "tokens live in Postgres: pass --pg <url> (or MYC_PG_URL)", ExitCode.PRECOND);
+      }
+
+      let pg: PostgresDriver | undefined;
+      try {
+        if (pgUrl !== undefined) pg = openPostgres(pgUrl);
+
+        if (applySchema) {
+          // Только на ПУСТОЙ базе. Накат поверх живой — это миграция, у неё
+          // другие правила (порядок, проверки, откат), и делать её молча
+          // «на всякий случай» при каждом старте контейнера нельзя.
+          const [existing] = await pg!.raw<{ t: string | null }>("SELECT to_regclass('public.nodes')::text AS t");
+          if (existing?.t !== null && existing?.t !== undefined) {
+            return { ok: true, data: { applied: false, reason: "the database already has a schema" } };
+          }
+          // Кто накатил — в учёте миграций. set_config идёт ОДНОЙ строкой с
+          // DDL, потому что это одно соединение пула: отдельным запросом
+          // настройка досталась бы другому, и база записала бы «psql».
+          await pg!.raw(`SELECT set_config('myc.by_version', '${CLI_VERSION.replace(/'/g, "''")}', false);\n${POSTGRES_DDL}`);
+          // BIGINT приходит из Postgres СТРОКОЙ (64 бита не влезают в number
+          // без потерь, и драйвер не угадывает). В JSON-ответе версия схемы —
+          // число, как и везде в myc, поэтому приведение здесь явное.
+          const [v] = await pg!.raw<{ v: string | null }>("SELECT max(version) AS v FROM schema_migrations");
+          return { ok: true, data: { applied: true, schema: v?.v == null ? null : Number(v.v) } };
+        }
+
+        if (wantMigrate) {
+          // ЯВНО И С ОТЧЁТОМ. Накат поверх живых данных — операция, у
+          // которой должен быть автор и время; молча при каждом подъёме
+          // контейнера её делать нельзя (см. --apply-schema рядом).
+          const before = await pgSchemaVersion(pg!);
+          if (before === 0) {
+            return failure(
+              "precond.no_schema",
+              "this database has no schema at all: there is nothing to migrate",
+              ExitCode.PRECOND,
+              "myc serve --pg <url> --apply-schema",
+            );
+          }
+          if (!(await canBypassRls(pg!))) {
+            return failure(
+              "precond.privileges",
+              "migrations run as the superuser, like --apply-schema: under the application role a data " +
+                "migration silently changes nothing and still records the version",
+              ExitCode.PRECOND,
+              "myc serve --pg postgres://postgres:…@host/myc --migrate",
+            );
+          }
+          const result = await migratePostgres(pg!);
+          return { ok: true, data: result satisfies PgMigrateResult };
+        }
+
+        if (addTenant !== undefined) {
+          const at = addTenant.indexOf(":");
+          const id = at < 0 ? addTenant : addTenant.slice(0, at);
+          const title = at < 0 ? "" : addTenant.slice(at + 1);
+          if (id.length === 0) {
+            return failure("usage.invalid", `--add-tenant expects <id>[:title], got '${addTenant}'`, ExitCode.USAGE);
+          }
+          const rows = await pg!.raw<{ id: string }>(
+            `INSERT INTO tenants (id, title, created_at) VALUES ($1, $2, $3)
+             ON CONFLICT (id) DO NOTHING RETURNING id`,
+            [id, title, Date.now()],
+          );
+          return { ok: true, data: { tenant: id, title, created: rows.length > 0 } };
+        }
+
+        if (addSpec !== undefined) {
+          const at = addSpec.indexOf(":");
+          if (at <= 0 || at === addSpec.length - 1) {
+            return failure("usage.invalid", `--add-token expects <tenant>:<name>, got '${addSpec}'`, ExitCode.USAGE);
+          }
+          const tenant = addSpec.slice(0, at);
+          const subject = addSpec.slice(at + 1);
+          // Незнакомый арендатор — ошибка человека, а не сбой: внешний ключ
+          // скажет то же самое, но словами базы и кодом internal.unexpected.
+          const known = await pg!.raw<{ id: string }>("SELECT id FROM tenants WHERE id = $1", [tenant]);
+          if (known.length === 0) {
+            return failure(
+              "notfound.tenant",
+              `no tenant '${tenant}' on this server`,
+              ExitCode.NOTFOUND,
+              `register it first: myc serve --pg <url> --add-tenant ${tenant}`,
+            );
+          }
+          const roleRaw = str(ctx, "role") ?? "member";
+          if (!isRole(roleRaw)) {
+            return failure("usage.invalid", `unknown role '${roleRaw}': ${ROLES.join("|")}`, ExitCode.USAGE);
+          }
+          const scopesRaw = str(ctx, "scopes");
+          const scopes = scopesRaw === undefined ? undefined : parseScopes(scopesRaw);
+          if (scopes !== undefined && scopes.length === 0) {
+            return failure(
+              "usage.invalid",
+              `--scopes '${scopesRaw}' has nothing known in it: ${SCOPES.join(",")}`,
+              ExitCode.USAGE,
+            );
+          }
+          const minted = await addToken(pg!, tenant, subject, {
+            role: roleRaw,
+            ...(scopes === undefined ? {} : { scopes }),
+            ...(str(ctx, "token-ws") === undefined ? {} : { ws: str(ctx, "token-ws")! }),
+          });
+          const data: TokenAdded = {
+            id: minted.id,
+            tenant,
+            subject,
+            token: minted.token,
+            role: minted.role,
+            scopes: minted.scopes.join(","),
+            ws: minted.ws,
+          };
+          return { ok: true, data };
+        }
+
+        if (revokeId !== undefined) {
+          const gone = await revokeToken(pg!, revokeId);
+          if (!gone) {
+            return failure("notfound.token", `no live token with id '${revokeId}'`, ExitCode.NOTFOUND);
+          }
+          return { ok: true, data: { id: revokeId, revoked: true } };
+        }
+
+        if (wantList) {
+          return { ok: true, data: { tokens: await listTokens(pg!) } };
+        }
+
+        // ПЕРВЫЙ АРЕНДАТОР И ПЕРВЫЙ ТОКЕН ИЗ ОКРУЖЕНИЯ (приёмка
+        // memory-3n0svbkbjaew: «docker compose up даёт рабочий сервер без
+        // ручных шагов»). Без этого поднятый контейнер — пустая коробка: в
+        // базе нет ни одного арендатора, и войти в неё нечем.
+        //
+        // ОБА ШАГА ИДЕМПОТЕНТНЫ и оба молчат, когда делать нечего: токен
+        // минтится ТОЛЬКО если у арендатора нет ни одного живого. Иначе
+        // каждый рестарт контейнера печатал бы в журнал новый секрет, и их
+        // накапливалось бы по числу перезапусков.
+        //
+        // Секрет уходит в ЖУРНАЛ, и это сказано вслух: в настоящей установке
+        // переменные убирают и выдают токен руками. Дверь эта открывается
+        // только явной переменной — по умолчанию её нет.
+        // ОТСТАВШАЯ БАЗА — ОТКАЗ, А НЕ МОЛЧАЛИВЫЙ СТАРТ (memory-rjb0vk556j8e).
+        // Сервер на схеме прошлой версии выглядит работающим ровно до
+        // первого запроса, который упрётся в недостающее; хуже того, на
+        // неё продолжают писать. Отказ называет оба номера и команду, а
+        // накат остаётся явным действием.
+        if (pg !== undefined) {
+          // «Не смог прочитать» — НЕ «отстала». База может быть просто ещё
+          // не поднята: контейнер сервера стартует раньше неё, и падать из-за
+          // этого он не должен — на то и разделены живость с готовностью.
+          // Отказ только когда версия ПРОЧИТАНА и она ниже нашей.
+          const have = await pgSchemaVersion(pg).catch(() => null);
+          const knows = knownSchemaVersion();
+          if (have !== null && have > 0 && have < knows) {
+            return failure(
+              "precond.schema",
+              `the database is at schema ${have}, this myc knows ${knows} — it would write through a schema it does not have`,
+              ExitCode.PRECOND,
+              "myc serve --pg <url> --migrate",
+            );
+          }
+        }
+
+        const bootstrapped = pg === undefined ? undefined : await bootstrapTenant(pg, deps.env ?? process.env);
+        if (bootstrapped !== undefined && !ctx.globals.json && !ctx.globals.ndjson) {
+          deps.write(bootstrapped);
+        }
+
+        const t0 = Date.now();
+        const server = startHttpServer({
+          port,
+          // Сколько знает ЭТОТ бинарь — иначе `migrations_pending` в health
+          // считать не из чего (см. ServerConfig.schemaKnown).
+          schemaKnown: knownSchemaVersion(),
+          ...(str(ctx, "host") !== undefined ? { host: str(ctx, "host")! } : {}),
+          ...(ctx.globals.directory !== undefined ? { dir: ctx.globals.directory } : {}),
+          ...(ctx.globals.db !== undefined ? { db: ctx.globals.db } : {}),
+          ...(pgUrl !== undefined ? { pg: pgUrl } : {}),
+        });
+        if (!ctx.globals.json && !ctx.globals.ndjson && !ctx.globals.quiet) {
+          deps.write(
+            `myc serve · ${pgUrl === undefined ? "sqlite (local health slice)" : "postgres (team server)"}\n` +
+              `${server.url}${pgUrl === undefined ? "" : `  admin: ${server.url}/v1/admin`}\n` +
+              // Куда идти агенту, а не человеку: данные лежат под /v1/ws/:ws/…
+              // и пока только на чтение — об этом честнее сказать сразу, чем
+              // дать узнать это кодом 405 в бою.
+              `${pgUrl === undefined ? "" : `workspace data (read-only): ${server.url}/v1/ws\n`}` +
+              `${pgUrl === undefined ? "no tokens: without --pg the server has no tenants and binds 127.0.0.1" : "every route but /v1/health needs a token: --add-token <tenant>:<name>"}\n` +
+              "Ctrl-C to stop\n",
+          );
+        }
+        const signal = await deps.wait();
+        server.stop();
+        const data: ServeStopped = {
+          url: server.url,
+          port: server.port,
+          pg: pgUrl !== undefined,
+          signal,
+          uptime_ms: Date.now() - t0,
+        };
+        return { ok: true, data };
+      } finally {
+        await pg?.close();
+      }
+    },
+    renderHuman: (raw) => {
+      const d = raw as Record<string, unknown>;
+      if (typeof d["token"] === "string") {
+        const t = raw as TokenAdded;
+        return (
+          `token ${t.id} for ${t.subject} @ ${t.tenant} · ${t.role} [${t.scopes}]` +
+          `${t.ws === "" ? "" : ` ws=${t.ws}`}\n` +
+          `${t.token}\n` +
+          "This is the only time the secret is shown: the server keeps its sha256, not the token.\n"
+        );
+      }
+      if (Array.isArray(d["tokens"])) {
+        const list = d["tokens"] as Array<{
+          id: string;
+          tenant: string;
+          subject: string;
+          role: string;
+          scopes: string;
+          ws: string;
+          last_used_at: number | null;
+          revoked_at: number | null;
+        }>;
+        if (list.length === 0) return "no tokens: nobody can reach this server yet\n";
+        return (
+          list
+            .map(
+              (t) =>
+                `${t.id}  ${t.tenant}/${t.subject}  ${t.role} [${t.scopes}]` +
+                `${t.ws === "" ? "" : ` ws=${t.ws}`}  ` +
+                `${t.revoked_at !== null ? "revoked" : t.last_used_at === null ? "never used" : `last used ${new Date(t.last_used_at).toISOString().slice(0, 16).replace("T", " ")}`}`,
+            )
+            .join("\n") + "\n"
+        );
+      }
+      if (d["revoked"] === true) return `token ${String(d["id"])} revoked\n`;
+      if (typeof d["created"] === "boolean") {
+        return d["created"] === true
+          ? `tenant ${String(d["tenant"])} registered\n`
+          : `tenant ${String(d["tenant"])} already there\n`;
+      }
+      if (typeof d["alive"] === "boolean") {
+        return `alive · uptime ${String(d["uptime_s"] ?? "?")}s\n`;
+      }
+      if (typeof d["applied"] === "boolean") {
+        return d["applied"] === true
+          ? "schema created\n"
+          : `schema left alone: ${String(d["reason"])}\n`;
+      }
+      const s = raw as ServeStopped;
+      return `stopped on ${s.signal} after ${Math.round(s.uptime_ms / 1000)}s\n`;
+    },
+  };
+}

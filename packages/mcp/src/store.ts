@@ -24,8 +24,7 @@ import {
   appliedSchemaVersion,
   migrate,
   migrations,
-  migrateVectors,
-  vectorMigrations,
+  ensureVectorSchema,
   GraphStore,
   Claims,
   SchemaError,
@@ -204,7 +203,8 @@ export type OpenMcpStoreResult =
   | { readonly ok: true; readonly handle: McpStoreHandle }
   | { readonly ok: false; readonly failure: McpStoreFailure };
 
-const QL = {
+/** @internal сторож допущений перевода диалекта (cli/src/dialect-registries.test.ts) */
+export const mcpQueries = {
   oplog_last_hlc: {
     name: "oplog_last_hlc",
     sql: "SELECT CAST(hlc AS TEXT) AS hlc FROM oplog ORDER BY seq DESC LIMIT 1",
@@ -219,42 +219,7 @@ const QL = {
   },
 } as const satisfies Record<string, QueryDef>;
 
-/**
- * Накат векторного набора с терпимостью к ОДНОВРЕМЕННОМУ первому открытию —
- * та же механика, что в CLI (S45). Векторные миграции идут БЕЗ транзакции
- * (откат CREATE VIRTUAL TABLE с теневыми таблицами vec0 движок не
- * гарантирует), поэтому «версия отстаёт» и сам накат не атомарны. Проигравший
- * в гонке не пострадавший: набор применит победитель, достаточно перечитать
- * таблицу учёта. SchemaError — не гонка, пробрасывается сразу.
- *
- * Без этого шага загруженный vec0 не давал ничего: расширение в соединении
- * есть, а `nodes_vec` не создаётся никогда — вторая половина дефекта myc-6lc.
- */
-function vecSchemaVersion(db: Database): number {
-  try {
-    const row = db
-      .query("SELECT max(version) AS v FROM schema_migrations_vec")
-      .get() as { v: number | null } | null;
-    return row?.v ?? 0;
-  } catch {
-    return 0;
-  }
-}
-
-async function ensureVectorSchema(db: Database): Promise<void> {
-  const maxKnown = vectorMigrations.reduce((m, mig) => Math.max(m, mig.version), 0);
-  for (let attempt = 0; attempt < 50; attempt++) {
-    if (vecSchemaVersion(db) === maxKnown) return;
-    try {
-      await migrateVectors(db, { vec0Loaded: true, writable: true });
-      return;
-    } catch (e) {
-      if (e instanceof SchemaError) throw e;
-      if (attempt === 49) throw e;
-      await new Promise((r) => setTimeout(r, 20));
-    }
-  }
-}
+const QL = mcpQueries;
 
 export function resolveActor(): string {
   return process.env.MYC_ACTOR ?? process.env.USER ?? "agent";
